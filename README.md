@@ -20,6 +20,8 @@ Supports:
   * Provides a Server and Client Codec so msgpack can be used as communication protocol for net/rpc.
     * Also includes an option for msgpack-rpc: http://wiki.msgpack.org/display/MSGPACK/RPC+specification
 
+API docs: http://godoc.org/github.com/ugorji/go-msgpack
+
 Usage
 -----
 
