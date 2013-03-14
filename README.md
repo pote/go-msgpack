@@ -1,7 +1,7 @@
 MsgPack library for Go.
 =======================
 
-Implements: http://wiki.msgpack.org/display/MSGPACK/Format+specification
+Implements: http://wiki.msgpack.org/display/MSGPACK/Format+specification  
 API Docs:   http://godoc.org/github.com/ugorji/go-msgpack
 
 To install:
@@ -48,11 +48,11 @@ Extensions can be any type: pointers, structs, custom types off
 arrays/slices, strings, etc.
 
 Some examples:
-> type BisSet   []int
-  type BitSet64 uint64
-  type UUID     string
-  type MyTimeWithUnexportedFields struct { a int; b bool; c []int; }
-  type GifImage struct { ... }
+> type BisSet   []int  
+  type BitSet64 uint64  
+  type UUID     string  
+  type MyTimeWithUnexportedFields struct { a int; b bool; c []int; }  
+  type GifImage struct { ... }  
 
 Typically, MyTimeWithUnexportedFields is encoded as an empty map because
 it has no exported fields, while UUID will be encoded as a string,
@@ -62,6 +62,13 @@ however you like.
 We provide implementations of these functions where the spec has defined
 an inter-operable format e.g. Binary and time.Time. Library users will
 have to explicitly configure these as seen in the usage below.
+
+RPC
+-----
+
+An RPC Client and Server Codec is implemented, so that msgpack can be used
+with the standard net/rpc package. It supports both a basic net/rpc serialization,
+and the custom format defined at http://wiki.msgpack.org/display/MSGPACK/RPC+specification.
 
 Usage
 -----
@@ -73,7 +80,7 @@ Usage
   eopts = msgpack.NewEncoderOptions()
   
   // configure extensions, to enable Binary and Time support for tags 1 and 2
-  dopts.AddExt(reflect.TypeOf([]byte(nil)), 0,msgpack. DecodeBinaryExt)
+  dopts.AddExt(reflect.TypeOf([]byte(nil)), 0, msgpack.DecodeBinaryExt)
   dopts.AddExt(reflect.TypeOf(time.Time{}), 1, msgpack.DecodeTimeExt)
 
   eopts.AddExt(reflect.TypeOf([]byte(nil)), 0, msgpack.EncodeBinaryExt)

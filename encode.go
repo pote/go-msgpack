@@ -499,6 +499,10 @@ func (e *Encoder) err(format string, params ...interface{}) {
 	doPanic(msgTagEnc, format, params)
 }
 
+// EncodeTimeExt encodes a time.Time as a msgpack byte stream
+// of one, two or 3 signed integer values representing
+// seconds since UnixEpoch, Fractional Nanoseconds, and quarter-hour offset
+// from UTC (added if the timezone is not UTC).
 func EncodeTimeExt(rv reflect.Value) ([]byte, error) {
 	t := rv.Interface().(time.Time)
 	
@@ -518,8 +522,10 @@ func EncodeTimeExt(rv reflect.Value) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// EncodeBinaryExt returns the underlying bytes of this value AS-IS.
+// Configure this to support the Binary Extension using tag 0.
 func EncodeBinaryExt(rv reflect.Value) ([]byte, error) {
-	return rv.Interface().([]byte), nil
+	return rv.Bytes(), nil
 }
 
 // Marshal is a convenience function which encodes v to a stream of bytes. 
