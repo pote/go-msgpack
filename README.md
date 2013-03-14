@@ -1,6 +1,8 @@
 MsgPack library for Go.
 =======================
 
+Version 1.0.
+
 Implements:
 >  [http://wiki.msgpack.org/display/MSGPACK/Format+specification]
 
