@@ -3,7 +3,7 @@
 go-msgpack - Msgpack library for Go. Provides pack/unpack and net/rpc support.
 https://github.com/ugorji/go-msgpack
 
-Copyright (c) 2012, Ugorji Nwoke.
+Copyright (c) 2012, 2013 Ugorji Nwoke.
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without modification,
@@ -59,9 +59,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"net"
+	"fmt"
+	"flag"
+	"encoding/gob"
 )
 
 var (
+	_ = fmt.Printf
 	skipVerifyVal interface{} = &(struct{}{})
 	timeToCompare = time.Date(2012, 2, 2, 2, 2, 2, 2000, time.UTC) //time.Time{} //
 	//"2012-02-02T02:02:02.000002000Z" //1328148122000002
@@ -72,7 +76,26 @@ var (
 	tablePythonVerify []interface{}   // for verifying for python, since Python sometimes
                                       // will encode a float32 as float64, or large int as uint
 	testRpcInt = new(TestRpcInt)
+	testInitDebug = flag.Bool("tdbg", false, "Test Debug")
+	testEncOpts = NewEncoderOptions()
+	testDecOpts = NewDecoderOptions()
 )
+
+func init() {
+	// delete(testDecOpts.ExtFuncs, timeTyp)
+	flag.Parse()
+	gob.Register(new(TestStruc))
+	if *testInitDebug {
+		ts0 := newTestStruc(2, false)
+		fmt.Printf("====> depth: %v, ts: %#v\n", 2, ts0)
+	}
+
+	testDecOpts.AddExt(byteSliceTyp, 0, DecodeBinaryExt)
+	testDecOpts.AddExt(timeTyp, 1, DecodeTimeExt)
+
+	testEncOpts.AddExt(byteSliceTyp, 0, EncodeBinaryExt)
+	testEncOpts.AddExt(timeTyp, 1, EncodeTimeExt)
+}
 
 type AnonInTestStruc struct {
 	AS string
@@ -113,7 +136,10 @@ type TestStruc struct {
 	T time.Time          
 	Nmap map[string]bool //don't set this, so we can test for nil
 	Nslice []byte        //don't set this, so we can test for nil
-	Nint64 *int64
+	Nint64 *int64        //don't set this, so we can test for nil
+	Mtsptr map[string]*TestStruc
+	Mts map[string]TestStruc
+	Its []*TestStruc
 	Nteststruc *TestStruc
 }
 
@@ -200,7 +226,8 @@ func init() {
 	copy(b, a[20].([]interface{}))
 	a[20] = b
 	b[0], b[4], b[8], b[16], b[19] = int8(-8), int8(8), int8(8), 
-		[]interface {}{int32(1328148122), int16(2000)}, "bytestring"
+		// []interface {}{int32(1328148122), int16(2000)}, "bytestring"
+		timeToCompare, "bytestring"
 	a[23] = skipVerifyVal 
 	//a[25] = skipVerifyVal
 	tableVerify = a
@@ -210,7 +237,7 @@ func init() {
 	a = make([]interface{}, len(tableVerify))
 	copy(a, tableVerify)
 	a[0], a[4], a[8], a[16], a[19] = int8(-8), int8(8), int8(8), 
-		[]interface {}{int32(1328148122), int16(2000)}, "bytestring"
+		timeToCompare, "bytestring"
 	a[21] = map[string]interface{}{"true":true, "false":false}
 	a[23] = table[23]
 	a[25] = skipVerifyVal
@@ -236,10 +263,10 @@ func init() {
 	tablePythonVerify = a
 }
 
-func newTestStruc(depth int, bench bool) (ts TestStruc) {
+func newTestStruc(depth int, bench bool) (ts *TestStruc) {
 	var i64a, i64b, i64c, i64d int64 = 64, 6464, 646464, 64646464
 	
-	ts = TestStruc {
+	ts = &TestStruc {
 		S: "some string",
 		I64: 64,
 		I16: 16,
@@ -285,25 +312,33 @@ func newTestStruc(depth int, bench bool) (ts TestStruc) {
 		//}
 		//gob cannot encode nil in element in array (encodeArray: nil element)
 		ts.Iptrslice = []*int64{nil, &i64a, nil, &i64b, nil, &i64c, nil, &i64d, nil}
+		// ts.Iptrslice = nil
 	}
 	if depth > 0 {
 		depth--
-		ts.Ms["TestStruc." + strconv.Itoa(depth)] = newTestStruc(depth, bench)
-		ts.Islice = append(ts.Islice, newTestStruc(depth, bench))
+		if ts.Mtsptr == nil {
+			ts.Mtsptr = make(map[string]*TestStruc)
+		}
+		if ts.Mts == nil {
+			ts.Mts = make(map[string]TestStruc)
+		}
+		ts.Mtsptr["0"] = newTestStruc(depth, bench)
+		ts.Mts["0"] = *(ts.Mtsptr["0"])
+		ts.Its = append(ts.Its, ts.Mtsptr["0"])
 	}
 	return
 }
 
 // doTestMsgpacks allows us test for different variations based on arguments passed.
-func doTestMsgpacks(t *testing.T, testNil bool, opts DecoderContainerResolver, // *DecoderOptions DecoderContainerResolver,	
+func doTestMsgpacks(t *testing.T, testNil bool, eopts *EncoderOptions, dopts *DecoderOptions, 
 	vs []interface{}, vsVerify []interface{}) {
 	//if testNil, then just test for when a pointer to a nil interface{} is passed. It should work.
 	//Current setup allows us test (at least manually) the nil interface or typed interface.
 	logT(t, "================ TestNil: %v ================\n", testNil)
 	for i, v0 := range vs {
 		logT(t, "..............................................")
-		logT(t, "         Testing: #%d: %T, %#v\n", i, v0, v0)
-		b0, err := Marshal(v0)
+		logT(t, "         Testing: #%d:, %T, %#v\n", i, v0, v0)
+		b0, err := Marshal(v0, testEncOpts)
 		if err != nil {
 			logT(t, err.Error())
 			failT(t)
@@ -313,23 +348,25 @@ func doTestMsgpacks(t *testing.T, testNil bool, opts DecoderContainerResolver, /
 		
 		var v1 interface{}
 		
-		dec := NewDecoder(bytes.NewBuffer(b0), opts)
+		dec := NewDecoder(bytes.NewBuffer(b0), dopts)
 		if testNil {
 			err = dec.Decode(&v1)
 		} else {
-			v0rt := intfTyp
-			if v0 != nil { 
-				v0rt = reflect.TypeOf(v0) 
+			if v0 != nil {
+				v0rt := reflect.TypeOf(v0) // ptr
+				rv1 := reflect.New(v0rt)
+				err = dec.Decode(rv1.Interface())
+				v1 = rv1.Elem().Interface()
+				// v1 = reflect.Indirect(reflect.ValueOf(v1)).Interface()
 			}
-			v1 = reflect.New(v0rt).Interface()
-			err = dec.Decode(v1)
 		}
 		
-		if v1 != nil {
-			logT(t, "         v1 returned: %T, %#v", v1, v1)
-			//we always indirect, because ptr to typed value may be passed (if not testNil)
-			v1 = reflect.Indirect(reflect.ValueOf(v1)).Interface()
-		}
+		logT(t, "         v1 returned: %T, %#v", v1, v1)
+		// if v1 != nil {
+		//	logT(t, "         v1 returned: %T, %#v", v1, v1)
+		//	//we always indirect, because ptr to typed value may be passed (if not testNil)
+		//	v1 = reflect.Indirect(reflect.ValueOf(v1)).Interface()
+		// }
 		if err != nil {
 			logT(t, "-------- Error: %v. Partial return: %v", err, v1)
 			failT(t)
@@ -341,56 +378,64 @@ func doTestMsgpacks(t *testing.T, testNil bool, opts DecoderContainerResolver, /
 			continue 
 		}
 		
-		if reflect.DeepEqual(v0check, v1) { 
+		if err = deepEqual(v0check, v1); err == nil { 
 			logT(t, "++++++++ Before and After marshal matched\n")
 		} else {
-			logT(t, "-------- Before and After marshal do not match: " + 
-				"(%T). ====> AGAINST: %T, %#v, DECODED: %T, %#v\n", v0, v0check, v0check, v1, v1)
+			logT(t, "-------- Before and After marshal do not match: Error: %v" + 
+				" ====> AGAINST: (%T) %#v, DECODED: (%T) %#v\n", err, v0check, v0check, v1, v1)
 			failT(t)
 		}
 	}
 }
 
 
-func TestMsgpacks(t *testing.T) {	
-	doTestMsgpacks(t, false, 
-		testDecOpts(nil, nil, false, true, true), 
-		table, tableVerify) 
+func TestMsgpackAll(t *testing.T) {
+	// dopts := testDecOpts(nil, nil, false, true, true), 
+	doTestMsgpacks(t, false, testEncOpts, testDecOpts, table, tableVerify) 
 }
 
-func TestMsgpacksNilStringMap(t *testing.T) {	
-	doTestMsgpacks(t, true,  
-		testDecOpts(mapStringIntfTyp, nil, true, true, true), 
-		table[:24], tableTestNilVerify[:24]) 
+func TestMsgpackNilStringMap(t *testing.T) {
+	dopts := *testDecOpts
+	dopts.MapType = mapStringIntfTyp
+	doTestMsgpacks(t, true, testEncOpts, &dopts, table[:24], tableTestNilVerify[:24]) 
 }
 
-func TestMsgpacksNilIntf(t *testing.T) {	
-	doTestMsgpacks(t, true, 
-		testDecOpts(nil, nil, false, true, true), 
-		table[24:], tableTestNilVerify[24:]) 
+// TODO: This test fails when run within go test. Not sure why. FIXME: Mar 11, 2013
+func TestMsgpackNilIntf(t *testing.T) {	
+	// dopts := testDecOpts(nil, nil, false, true, true), 
+	doTestMsgpacks(t, true, testEncOpts, testDecOpts, table[24:], tableTestNilVerify[24:]) 
 }
 
-func TestDecodeToTypedNil(t *testing.T) {
-	b, err := Marshal(32)
-	var i *int32
-	if err = Unmarshal(b, i, nil); err == nil {
-		logT(t, "------- Expecting error because we cannot unmarshal to int32 nil ptr")
-		t.FailNow()
-	}
+func TestMsgpackString(t *testing.T) {	
+	// fmt.Printf("VVVVV %v\n", table)
+	// testDecOpts(nil, nil, false, true, true), 
+	// testDecOpts(mapStringIntfTyp, nil, true, true, true), 
+	doTestMsgpacks(t, true, testEncOpts, testDecOpts, table[17:18], tableTestNilVerify[17:18]) 
+}
+
+
+func TestMsgpackDecodeToTypedNil(t *testing.T) {
+	b, err := Marshal(32, testEncOpts)
+	// Cannot do this nil one, because faster type assertion decoding will panic
+	// var i *int32
+	// if err = Unmarshal(b, i, nil); err == nil {
+	// 	logT(t, "------- Expecting error because we cannot unmarshal to int32 nil ptr")
+	// 	t.FailNow()
+	// }
 	var i2 int32 = 0
-	if err = Unmarshal(b, &i2, nil); err != nil {
+	if err = Unmarshal(b, &i2, testDecOpts); err != nil {
 		logT(t, "------- Cannot unmarshal to int32 ptr. Error: %v", err)
 		t.FailNow()
 	}
 	if i2 != int32(32) {
-		logT(t, "------- didn't unmarshal to 32: Received: %d", *i)
+		logT(t, "------- didn't unmarshal to 32: Received: %d", i2)
 		t.FailNow()
 	}
 }
 
-func TestDecodePtr(t *testing.T) {
+func TestMsgpackDecodePtr(t *testing.T) {
 	ts := newTestStruc(0, false)
-	b, err := Marshal(&ts)
+	b, err := Marshal(ts, testEncOpts)
 	if err != nil {
 		logT(t, "------- Cannot Marshal pointer to struct. Error: %v", err)
 		t.FailNow()
@@ -398,8 +443,9 @@ func TestDecodePtr(t *testing.T) {
 		logT(t, "------- Size must be > 40. Size: %d", len(b))
 		t.FailNow()
 	}
+	logT(t, "------- b: %v", b)
 	ts2 := new(TestStruc)
-	err = Unmarshal(b, &ts2, nil)
+	err = Unmarshal(b, ts2, testDecOpts)
 	if err != nil {
 		logT(t, "------- Cannot Unmarshal pointer to struct. Error: %v", err)
 		t.FailNow()
@@ -409,17 +455,17 @@ func TestDecodePtr(t *testing.T) {
 	}
 }
 
-func TestIntfDecode(t *testing.T) {
+func TestMsgpackIntfDecode(t *testing.T) {
 	m := map[string]int{"A":2, "B":3, }
 	p := []interface{}{m}
-	bs, err := Marshal(p)
+	bs, err := Marshal(p, testEncOpts)
 	if err != nil {
 		logT(t, "Error marshalling p: %v, Err: %v", p, err)
 		t.FailNow()
 	}
 	m2 := map[string]int{}
 	p2 := []interface{}{m2}
-    err = Unmarshal(bs, &p2, nil)
+    err = Unmarshal(bs, &p2, testDecOpts)
 	if err != nil {
 		logT(t, "Error unmarshalling into &p2: %v, Err: %v", p2, err)
 		t.FailNow()
@@ -430,24 +476,24 @@ func TestIntfDecode(t *testing.T) {
 		t.FailNow()
 	}
 	// log("m: %v, m2: %v, p: %v, p2: %v", m, m2, p, p2)
-	if reflect.DeepEqual(p, p2) {
+	if err = deepEqual(p, p2); err == nil {
 		logT(t, "p and p2 match")
 	} else {
-		logT(t, "Not Equal: p: %v, p2: %v", p, p2)
+		logT(t, "Not Equal: %v. p: %v, p2: %v", err, p, p2)
 		t.FailNow()
 	}
-	if reflect.DeepEqual(m, m2) {
+	if err = deepEqual(m, m2); err == nil {
 		logT(t, "m and m2 match")
 	} else {
-		logT(t, "Not Equal: m: %v, m2: %v", m, m2)
+		logT(t, "Not Equal: %v. m: %v, m2: %v", err, m, m2)
 		t.FailNow()
 	}
 }
 
-func TestDecodeStructSubset(t *testing.T) {
+func TestMsgpackDecodeStructSubset(t *testing.T) {
 	// test that we can decode a subset of the stream
 	m := map[string]interface{}{"A": 5, "B": 99, "C": 333, }
-	bs, err := Marshal(m)
+	bs, err := Marshal(m, testEncOpts)
 	if err != nil {
 		logT(t, "Error marshalling m: %v, Err: %v", m, err)
 		t.FailNow()
@@ -457,14 +503,14 @@ func TestDecodeStructSubset(t *testing.T) {
 		C int32
 	}
 	var t2 ttt
-	err = Unmarshal(bs, &t2, nil)
+	err = Unmarshal(bs, &t2, testDecOpts)
 	if err != nil {
 		logT(t, "Error unmarshalling into &t2: %v, Err: %v", t2, err)
 		t.FailNow()
 	}
 	t3 := ttt{5, 333}
-	if !reflect.DeepEqual(t2, t3) {
-		logT(t, "Not Equal: t2: %v, t3: %v", t2, t3)
+	if err = deepEqual(t2, t3); err != nil {
+		logT(t, "Not Equal: %v.t2: %v, t3: %v", err, t2, t3)
 		t.FailNow()
 	}
 }
@@ -474,11 +520,11 @@ func TestRpcAll(t *testing.T) {
 	testRpc(t, true, true, true, true)
 }
 
-func TestRpc(t *testing.T) {
+func TestRpcBasic(t *testing.T) {
 	testRpc(t, true, true, false, true)
 }
 
-func TestCustomRpc(t *testing.T) {
+func TestRpcCustom(t *testing.T) {
 	testRpc(t, true, false, true, true)
 }
 
@@ -490,7 +536,10 @@ func testRpc(t *testing.T, callClose, doBasic, doCustom, doExit bool) {
 	checkErrT(t, err)
 	defer ln.Close()
 	
-	var opts DecoderContainerResolver
+	var opts *DecoderOptions
+	// opts := testDecOpts
+	// opts.MapType = mapStringIntfTyp
+	// opts.RawToString = false
 	serverExitChan := make(chan bool, 1)
 	serverFn := func() {
 		for { 
@@ -507,11 +556,12 @@ func testRpc(t *testing.T, callClose, doBasic, doCustom, doExit bool) {
 			var sc rpc.ServerCodec
 			switch bs[0] {
 			case 'B': 
-				sc = NewRPCServerCodec(conn1, opts)
+				sc = GoRpc.ServerCodec(conn1, nil, opts)
 			case 'C':
-				sc = NewCustomRPCServerCodec(conn1, opts)
+				sc = SpecRpc.ServerCodec(conn1, nil, opts)
 			case 'X':
 				serverExitChan <- true
+				// <- serverExitChan				
 				conn1.Close()
 				return // exit serverFn goroutine
 			}
@@ -562,18 +612,19 @@ func testRpc(t *testing.T, callClose, doBasic, doCustom, doExit bool) {
 	go serverFn()
 	if doBasic {
 		bs := connFn('B')
-		cc := NewRPCClientCodec(bs, opts)
+		cc := GoRpc.ClientCodec(bs, nil, opts)
 		clientFn(cc)
 	}
 	if doCustom {
 		bs := connFn('C')
-		cc := NewCustomRPCClientCodec(bs, opts)
+		cc := SpecRpc.ClientCodec(bs, nil, opts)
 		clientFn(cc)
 	}
 	if doExit {
 		bs := connFn('X')
 		<- serverExitChan
 		bs.Close()
+		// serverExitChan <- true
 	}
 }
 
@@ -588,7 +639,7 @@ func TestPythonGenStreams(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpdir)
 	logT(t, "tmpdir: %v", tmpdir)
-	cmd := exec.Command("python", "helper.py", "testdata", tmpdir)
+	cmd := exec.Command("python", "msgpack_test.py", "testdata", tmpdir)
 	//cmd.Stdin = strings.NewReader("some input")
 	//cmd.Stdout = &out
 	var cmdout []byte
@@ -613,8 +664,9 @@ func TestPythonGenStreams(t *testing.T) {
 			failT(t)
 			continue
 		}
-		dec := NewDecoder(bytes.NewBuffer(bss),
-			testDecOpts(mapStringIntfTyp, nil, true, true, true))
+		dopts := testDecOpts
+		dopts.MapType = mapStringIntfTyp
+		dec := NewDecoder(bytes.NewBuffer(bss), dopts)
 		var v1 interface{}
 		if err = dec.Decode(&v1); err != nil {
 			logT(t, "-------- Error decoding stream: %d: Err: %v", i, err)
@@ -626,24 +678,24 @@ func TestPythonGenStreams(t *testing.T) {
 		}
 		//no need to indirect, because we pass a nil ptr, so we already have the value 
 		//if v1 != nil { v1 = reflect.Indirect(reflect.ValueOf(v1)).Interface() }
-		if reflect.DeepEqual(v, v1) { 
+		if err = deepEqual(v, v1); err == nil { 
 			logT(t, "++++++++ Objects match")
 		} else {
-			logT(t, "-------- Objects do not match: Source: %T. Decoded: %T", v, v1)
+			logT(t, "-------- Objects do not match: %v. Source: %T. Decoded: %T", err, v, v1)
 			logT(t, "--------   AGAINST: %#v", v)
-			logT(t, "--------   DECODED: %#v", v1)
+			logT(t, "--------   DECODED: %#v <====> %#v", v1, reflect.Indirect(reflect.ValueOf(v1)).Interface())
 			failT(t)
 		}
 		bsb := new(bytes.Buffer)
-		if err = NewEncoder(bsb).Encode(v1); err != nil {
+		if err = NewEncoder(bsb, testEncOpts).Encode(v1); err != nil {
 			logT(t, "Error encoding to stream: %d: Err: %v", i, err)
 			failT(t)
 			continue
 		}
-		if reflect.DeepEqual(bsb.Bytes(), bss) { 
+		if err = deepEqual(bsb.Bytes(), bss); err == nil { 
 			logT(t, "++++++++ Bytes match")
 		} else {
-			logT(t, "???????? Bytes do not match")
+			logT(t, "???????? Bytes do not match. %v.", err)
 			xs := "--------"
 			if reflect.ValueOf(v).Kind() == reflect.Map {
 				xs = "        "
@@ -659,9 +711,17 @@ func TestPythonGenStreams(t *testing.T) {
 	
 }
 
+/*
+func testDecOpts() *DecoderOptions {
+	dopts := NewDecoderOptions(false)
+	delete(dopts.ExtFuncs, timeTyp)
+	return dopts
+}
+
 func testDecOpts(MapType reflect.Type, SliceType reflect.Type, BytesStringLiteral bool,
 	BytesStringSliceElement bool, BytesStringMapValue bool) DecoderContainerResolver {
 	return &SimpleDecoderContainerResolver {
 		MapType, SliceType, BytesStringLiteral, BytesStringSliceElement, BytesStringMapValue,
 	}
 }
+*/

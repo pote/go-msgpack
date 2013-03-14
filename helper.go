@@ -3,7 +3,7 @@
 go-msgpack - Msgpack library for Go. Provides pack/unpack and net/rpc support.
 https://github.com/ugorji/go-msgpack
 
-Copyright (c) 2012, Ugorji Nwoke.
+Copyright (c) 2012, 2013 Ugorji Nwoke.
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without modification,
@@ -32,6 +32,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 package msgpack
 
+// Contains code shared by both encode and decode.
+
 import (
 	"unicode"
 	"unicode/utf8"
@@ -39,30 +41,46 @@ import (
 	"sync"
 	"strings"
 	"fmt"
+	"sort"
 	"time"
 )
 
-type ContainerType byte
+// A Container type specifies the different types of containers.
+type containerType struct {
+	cutoff int8
+	b0, b1, b2 byte
+}
 
-const (
-	ContainerRawBytes = ContainerType('b')
-	ContainerList = ContainerType('a')
-	ContainerMap = ContainerType('m')
+var (
+	containerRawBytes = containerType{32, 0xa0, 0xda, 0xdb}
+	containerList = containerType{16, 0x90, 0xdc, 0xdd}
+	containerMap = containerType{16, 0x80, 0xde, 0xdf}
 )
 
 var (
 	structInfoFieldName = "_struct"
 	
 	cachedStructFieldInfos = make(map[reflect.Type]*structFieldInfos, 4)
-	cachedStructFieldInfosMutex sync.Mutex
+	cachedStructFieldInfosMutex sync.RWMutex
 
 	nilIntfSlice = []interface{}(nil)
 	intfSliceTyp = reflect.TypeOf(nilIntfSlice)
 	intfTyp = intfSliceTyp.Elem()
 	byteSliceTyp = reflect.TypeOf([]byte(nil))
-	timeTyp = reflect.TypeOf(time.Time{})
+	ptrByteSliceTyp = reflect.TypeOf((*[]byte)(nil))
 	mapStringIntfTyp = reflect.TypeOf(map[string]interface{}(nil))
 	mapIntfIntfTyp = reflect.TypeOf(map[interface{}]interface{}(nil))
+	timeTyp = reflect.TypeOf(time.Time{})
+	ptrTimeTyp = reflect.TypeOf((*time.Time)(nil))
+	int64SliceTyp = reflect.TypeOf([]int64(nil))
+	
+	intBitsize uint8 = uint8(reflect.TypeOf(int(0)).Bits())
+	uintBitsize uint8 = uint8(reflect.TypeOf(uint(0)).Bits())
+)
+
+const (
+	mapAccessThreshold = 4
+	binarySearchThreshold = 9
 )
 
 type structFieldInfo struct {
@@ -73,12 +91,24 @@ type structFieldInfo struct {
 	encName   string   // encode name
 	encNameBs []byte
 	name      string   // field name
+	ikind     int      // kind of the field as an int i.e. int(reflect.Kind)
 }
 
 type structFieldInfos struct {
 	sis []*structFieldInfo
 }
 
+type sfiSortedByEncName []*structFieldInfo
+
+func (p sfiSortedByEncName) Len() int           { return len(p) }
+func (p sfiSortedByEncName) Less(i, j int) bool { return p[i].encName < p[j].encName }
+func (p sfiSortedByEncName) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
+
+func (c containerType) IsValid() bool {
+	return c.b0 > 0
+}
+
+// return the field in struc for this fieldInfo.
 func (si *structFieldInfo) field(struc reflect.Value) (rv reflect.Value) {
 	if si.i > -1 {
 		rv = struc.Field(si.i)
@@ -88,19 +118,39 @@ func (si *structFieldInfo) field(struc reflect.Value) (rv reflect.Value) {
 	return
 }
 
-// linear search. faster than binary search in my testing up to 16-field structs.
 func (sis *structFieldInfos) getForEncName(name string) (si *structFieldInfo) {
-	for _, si = range sis.sis {
-		if si.encName == name {
-			return
+	sislen := len(sis.sis)
+	if sislen < binarySearchThreshold {
+		// linear search. faster than binary search in my testing up to 16-field structs.
+		for i := 0; i < sislen; i++ {
+			if sis.sis[i].encName == name {
+				si = sis.sis[i]
+				break
+			}
+		}
+	} else {
+		// binary search. adapted from sort/search.go.
+		h, i, j := 0, 0, sislen
+		for i < j {
+			h = i + (j-i)/2 
+			// i ≤ h < j
+			if sis.sis[h].encName < name {
+				i = h + 1 // preserves f(i-1) == false
+			} else {
+				j = h // preserves f(j) == true
+			}
+		}
+		if i < sislen && sis.sis[i].encName == name {
+			si = sis.sis[i]
 		}
 	}
-	si = nil
 	return
 }
 
 func getStructFieldInfos(rt reflect.Type) (sis *structFieldInfos) {
+	cachedStructFieldInfosMutex.RLock()
 	sis, ok := cachedStructFieldInfos[rt]
+	cachedStructFieldInfosMutex.RUnlock()
 	if ok {
 		return 
 	}
@@ -115,6 +165,7 @@ func getStructFieldInfos(rt reflect.Type) (sis *structFieldInfos) {
 		siInfo = parseStructFieldInfo(structInfoFieldName, f.Tag.Get("msgpack"))
 	}
 	rgetStructFieldInfos(rt, nil, sis, siInfo)
+	sort.Sort(sfiSortedByEncName(sis.sis))
 	cachedStructFieldInfos[rt] = sis
 	return
 }
@@ -139,7 +190,7 @@ func rgetStructFieldInfos(rt reflect.Type, indexstack []int, sis *structFieldInf
 			}
 		}
 		si := parseStructFieldInfo(f.Name, stag)
-		
+		si.ikind = int(f.Type.Kind())
 		if len(indexstack) == 0 {
 			si.i = j
 		} else {
@@ -191,34 +242,9 @@ func parseStructFieldInfo(fname string, stag string) (si *structFieldInfo) {
 	return
 }
 
-func getContainerByteDesc(ct ContainerType) (cutoff int, b0, b1, b2 byte) {
-	switch ct {
-	case ContainerRawBytes:
-		cutoff = 32
-		b0, b1, b2 = 0xa0, 0xda, 0xdb
-	case ContainerList:
-		cutoff = 16
-		b0, b1, b2 = 0x90, 0xdc, 0xdd
-	case ContainerMap:
-		cutoff = 16
-		b0, b1, b2 = 0x80, 0xde, 0xdf
-	default:
-		panic(fmt.Errorf("getContainerByteDesc: Unknown container type: %v", ct))
-	}
-	return
-}
-
-func reflectValue(v interface{}) (rv reflect.Value) {
-	rv, ok := v.(reflect.Value)
-	if !ok {
-		rv = reflect.ValueOf(v)
-	}
-	return 
-}
-
 func panicToErr(err *error) {
 	if x := recover(); x != nil { 
-		panicToErrT(x, err)
+		panicValToErr(x, err)
 	}
 }
 

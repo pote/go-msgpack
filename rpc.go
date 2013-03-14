@@ -3,7 +3,7 @@
 go-msgpack - Msgpack library for Go. Provides pack/unpack and net/rpc support.
 https://github.com/ugorji/go-msgpack
 
-Copyright (c) 2012, Ugorji Nwoke.
+Copyright (c) 2012, 2013 Ugorji Nwoke.
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without modification,
@@ -35,17 +35,33 @@ RPC
 
 An RPC Client and Server Codec is implemented, so that msgpack can be used
 with the standard net/rpc package. It supports both a basic net/rpc serialization,
-and the custom format defined at http://wiki.msgpack.org/display/MSGPACK/RPC+specification
+and the custom format defined at http://wiki.msgpack.org/display/MSGPACK/RPC+specification.
 
 */
 package msgpack
 
 import (
 	"fmt"
-	"strings"
 	"net/rpc"
 	"io"
 )
+
+var (
+	// GoRpc is the implementation of Rpc that uses basic msgpack serialization
+	// as defined in net/rpc package for communication.
+	GoRpc = goRpc{}
+	// SpecRpc is the Rpc implementation that uses a custom protocol defined by
+	// the msgpack spec at http://wiki.msgpack.org/display/MSGPACK/RPC+specification
+	SpecRpc = specRpc{}
+)
+
+type Rpc interface {
+	ServerCodec(conn io.ReadWriteCloser, eopts *EncoderOptions, dopts *DecoderOptions) (rpc.ServerCodec) 
+	ClientCodec(conn io.ReadWriteCloser, eopts *EncoderOptions, dopts *DecoderOptions) (rpc.ClientCodec)
+}
+
+type goRpc struct {}
+type specRpc struct{}
 
 type rpcCodec struct {
 	rwc       io.ReadWriteCloser
@@ -53,50 +69,38 @@ type rpcCodec struct {
 	enc       *Encoder
 }
 
-type basicRpcCodec struct {
+type goRpcCodec struct {
 	rpcCodec
 }
 
-type customRpcCodec struct {
+type specRpcCodec struct {
 	rpcCodec
 }
 
-func newRPCCodec(conn io.ReadWriteCloser, opts DecoderContainerResolver) (rpcCodec) {
+func newRPCCodec(conn io.ReadWriteCloser, eopts *EncoderOptions, dopts *DecoderOptions) (rpcCodec) {
 	return rpcCodec{
 		rwc: conn,
-		dec: NewDecoder(conn, opts),
-		enc: NewEncoder(conn),
+		dec: NewDecoder(conn, dopts),
+		enc: NewEncoder(conn, eopts),
 	}
 }
 
-// NewRPCClientCodec uses basic msgpack serialization for rpc communication from client side.
-// 
-// Sample Usage:
-//   conn, err = net.Dial("tcp", "localhost:5555")
-//   codec, err := msgpack.NewRPCClientCodec(conn, nil)
-//   client := rpc.NewClientWithCodec(codec)
-//   ... (see rpc package for how to use an rpc client)
-func NewRPCClientCodec(conn io.ReadWriteCloser, opts DecoderContainerResolver) (rpc.ClientCodec) {
-	return &basicRpcCodec{ newRPCCodec(conn, opts) }
+func (goRpc) ServerCodec(conn io.ReadWriteCloser, eopts *EncoderOptions, dopts *DecoderOptions) (rpc.ServerCodec) {
+	return &goRpcCodec{ newRPCCodec(conn, eopts, dopts) }
 }
 
-// NewRPCServerCodec uses basic msgpack serialization for rpc communication from the server side.
-func NewRPCServerCodec(conn io.ReadWriteCloser, opts DecoderContainerResolver) (rpc.ServerCodec) {
-	return &basicRpcCodec{ newRPCCodec(conn, opts) }
+func (goRpc) ClientCodec(conn io.ReadWriteCloser, eopts *EncoderOptions, dopts *DecoderOptions) (rpc.ClientCodec) {
+	return &goRpcCodec{ newRPCCodec(conn, eopts, dopts) }
 }
 
-// NewCustomRPCClientCodec uses msgpack serialization for rpc communication from client side, 
-// but uses a custom protocol defined at http://wiki.msgpack.org/display/MSGPACK/RPC+specification
-func NewCustomRPCClientCodec(conn io.ReadWriteCloser, opts DecoderContainerResolver) (rpc.ClientCodec) {
-	return &customRpcCodec{ newRPCCodec(conn, opts) }
+func (specRpc) ServerCodec(conn io.ReadWriteCloser, eopts *EncoderOptions, dopts *DecoderOptions) (rpc.ServerCodec) {
+	return &specRpcCodec{ newRPCCodec(conn, eopts, dopts) }
 }
-	
-// NewCustomRPCServerCodec uses msgpack serialization for rpc communication from server side, 
-// but uses a custom protocol defined at http://wiki.msgpack.org/display/MSGPACK/RPC+specification
-func NewCustomRPCServerCodec(conn io.ReadWriteCloser, opts DecoderContainerResolver) (rpc.ServerCodec) {
-	return &customRpcCodec{ newRPCCodec(conn, opts) }
+
+func (specRpc) ClientCodec(conn io.ReadWriteCloser, eopts *EncoderOptions, dopts *DecoderOptions) (rpc.ClientCodec) {
+	return &specRpcCodec{ newRPCCodec(conn, eopts, dopts) }
 }
-	
+
 // /////////////// RPC Codec Shared Methods ///////////////////
 func (c *rpcCodec) write(objs ...interface{}) (err error) {
 	for _, obj := range objs {
@@ -116,38 +120,8 @@ func (c *rpcCodec) read(objs ...interface{}) (err error) {
 	return
 }
 
-// maybeEOF is used to possibly return EOF for functions (e.g. ReadXXXHeader) that
-// should return EOF if underlying connection was closed.
-// This is important because rpc uses goroutines on clients (to support sync and async models)
-// and on the server. Consequently, for calling Client.Close to work for example, the 
-// ReadRequestHeader and ReadResponseHeader methods should return EOF if underlying network 
-// connection was closed (e.g. by Client.Close). 
-// 
-// It's a best effort, as there's no general error returned for Using Closed Network Connection.
-func (c *rpcCodec) maybeEOF(err error) (errx error) {
-	if err == nil {
-		return nil
-	}
-	// defer func() { fmt.Printf("maybeEOF: orig: %T, %v, returning: %T, %v\n", err, err, errx, errx) }()
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		return io.EOF
-	} 
-	errstr := err.Error()
-	if strings.HasSuffix(errstr, "use of closed network connection") {
-		return io.EOF
-	}
-	// switch nerr := err.(type) {
-	// case *net.OpError:
-	// 	println(" ***** *net.OpError ***** ", nerr.Err.Error())
-	// 	if nerr.Err.Error() == "use of closed network connection" {
-	// 		return io.EOF
-	// 	}
-	// }
-	return err
-}
-
 func (c *rpcCodec) Close() error {
-	// fmt.Printf("Calling rpcCodec.Close: %v\n----------------------\n", string(debug.Stack()))
+	// fmt.Printf("Calling rpcCodec.Close: %v\n-----------\n", string(debug.Stack()))
 	return c.rwc.Close()
 	
 }
@@ -157,49 +131,49 @@ func (c *rpcCodec) ReadResponseBody(body interface{}) error {
 }
 
 // /////////////// Basic RPC Codec ///////////////////
-func (c *basicRpcCodec) WriteRequest(r *rpc.Request, body interface{}) error {
+func (c *goRpcCodec) WriteRequest(r *rpc.Request, body interface{}) error {
 	return c.write(r, body)
 }
 
-func (c *basicRpcCodec) WriteResponse(r *rpc.Response, body interface{}) error {
+func (c *goRpcCodec) WriteResponse(r *rpc.Response, body interface{}) error {
 	return c.write(r, body)
 }
 
-func (c *basicRpcCodec) ReadRequestBody(body interface{}) error {
+func (c *goRpcCodec) ReadRequestBody(body interface{}) error {
 	return c.dec.Decode(body)
 }
 
-func (c *basicRpcCodec) ReadResponseHeader(r *rpc.Response) error {
-	return c.maybeEOF(c.dec.Decode(r))
+func (c *goRpcCodec) ReadResponseHeader(r *rpc.Response) error {
+	return c.dec.Decode(r)
 }
 
-func (c *basicRpcCodec) ReadRequestHeader(r *rpc.Request) error {
-	return c.maybeEOF(c.dec.Decode(r))
+func (c *goRpcCodec) ReadRequestHeader(r *rpc.Request) error {
+	return c.dec.Decode(r)
 }
 
 // /////////////// Custom RPC Codec ///////////////////
-func (c *customRpcCodec) WriteRequest(r *rpc.Request, body interface{}) error {
+func (c *specRpcCodec) WriteRequest(r *rpc.Request, body interface{}) error {
 	return c.writeCustomBody(0, r.Seq, r.ServiceMethod, []interface{}{body})
 }
 
-func (c *customRpcCodec) WriteResponse(r *rpc.Response, body interface{}) error {
+func (c *specRpcCodec) WriteResponse(r *rpc.Response, body interface{}) error {
 	return c.writeCustomBody(1, r.Seq, r.Error, body)
 }
 
-func (c *customRpcCodec) ReadRequestBody(body interface{}) error {
+func (c *specRpcCodec) ReadRequestBody(body interface{}) error {
 	bodyArr := []interface{}{body}
 	return c.dec.Decode(&bodyArr)
 }
 
-func (c *customRpcCodec) ReadResponseHeader(r *rpc.Response) error {
-	return c.maybeEOF(c.parseCustomHeader(1, &r.Seq, &r.Error))
+func (c *specRpcCodec) ReadResponseHeader(r *rpc.Response) error {
+	return c.parseCustomHeader(1, &r.Seq, &r.Error)
 }
 
-func (c *customRpcCodec) ReadRequestHeader(r *rpc.Request) error {
-	return c.maybeEOF(c.parseCustomHeader(0, &r.Seq, &r.ServiceMethod))
+func (c *specRpcCodec) ReadRequestHeader(r *rpc.Request) error {
+	return c.parseCustomHeader(0, &r.Seq, &r.ServiceMethod)
 }
 
-func (c *customRpcCodec) parseCustomHeader(expectTypeByte byte, msgid *uint64, methodOrError *string) (err error) {
+func (c *specRpcCodec) parseCustomHeader(expectTypeByte byte, msgid *uint64, methodOrError *string) (err error) {
 
 	// We read the response header by hand 
 	// so that the body can be decoded on its own from the stream at a later time.
@@ -229,7 +203,7 @@ func (c *customRpcCodec) parseCustomHeader(expectTypeByte byte, msgid *uint64, m
 	return
 }
 
-func (c *customRpcCodec) writeCustomBody(typeByte byte, msgid uint64, methodOrError string, body interface{}) (err error) {
+func (c *specRpcCodec) writeCustomBody(typeByte byte, msgid uint64, methodOrError string, body interface{}) (err error) {
 	var moe interface{} = methodOrError
 	// response needs nil error (not ""), and only one of error or body can be nil
 	if typeByte == 1 {

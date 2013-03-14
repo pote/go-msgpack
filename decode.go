@@ -3,7 +3,7 @@
 go-msgpack - Msgpack library for Go. Provides pack/unpack and net/rpc support.
 https://github.com/ugorji/go-msgpack
 
-Copyright (c) 2012, Ugorji Nwoke.
+Copyright (c) 2012, 2013 Ugorji Nwoke.
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without modification,
@@ -32,176 +32,148 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 package msgpack
 
-// Code here is organized as follows:
-// Exported methods are not called internally. They are just facades.
-//   Unmarshal calls Decode 
-//   Decode calls DecodeValue 
-//   DecodeValue calls decodeValue 
-// decodeValue and all other unexported functions use panics (not errors)
-//    and may call other unexported functions (which use panics).
-
-// Refactoring halted because we need a solution for map keys which are slices.
-// Easy way is to convert it to a string.
-// 
-// To test with it, 
-//   - change rpc.go, msgpack_test.go to use 
-//     DecoderContainerResolver instead of *DecoderOptions (r:40, m:256, m:466)
-//     &SimpleDecoderContainerResolver instead of &DecoderOptions (m: 467)
-
 import (
 	"io"
 	"bytes"
 	"reflect"
 	"math"
 	"fmt"
-	// "net"
-	"time"
-	// "runtime/debug"
 	"encoding/binary"
+	"time"
 )
 
 // Some tagging information for error messages.
 var (
-	//_ = time.Parse
+	_ = fmt.Printf
 	msgTagDec = "msgpack.decoder"
-	msgBadDesc = "Unrecognized descriptor byte: "
+	msgBadDesc = "Unrecognized descriptor byte"
 )
 
-// Default DecoderContainerResolver used when a nil parameter is passed to NewDecoder().
-// Sample Usage:
-//   opts := msgpack.DefaultDecoderContainerResolver // makes a copy
-//   opts.BytesStringLiteral = false // change some options
-//   err := msgpack.NewDecoder(r, &opts).Decode(&v)
-var DefaultDecoderContainerResolver = SimpleDecoderContainerResolver {
-	MapType: nil,
-	SliceType: nil,
-	BytesStringLiteral: true,
-	BytesStringSliceElement: true,
-	BytesStringMapValue: true,
-}
+type decNil struct { }
+type decExt struct { }
 
 // A Decoder reads and decodes an object from an input stream in the msgpack format.
 type Decoder struct {
+	bd byte
+	bdRead bool
+	eof bool
 	r io.Reader
-	dam DecoderContainerResolver
+	opts *DecoderOptions
 	x [16]byte        //temp byte array re-used internally for efficiency
 	t1, t2, t4, t8 []byte // use these, so no need to constantly re-slice
 }
 
-// DecoderContainerResolver has the DecoderContainer method for getting a usable reflect.Value
-// when decoding a container (map, array, raw bytes) from a stream into a nil interface{}.
-type DecoderContainerResolver interface {
-	// DecoderContainer is used to get a proper reflect.Value when decoding 
-	// a msgpack map, array or raw bytes (for which the stream defines the length and 
-	// corresponding containerType) into a nil interface{}. 
-	// 
-	// This may be within the context of a container: ([]interface{} or map[XXX]interface{}),
-	// or just a top-level literal.
-	// 
-	// The parentcontainer and parentkey define the context
-	//   - If decoding into a map, they will be the map and the key in the map (a reflect.Value)
-	//   - If decoding into a slice, they will be the slice and the index into the slice (an int)
-	//   - Else they will be Invalid/nil
-	// 
-	// Custom code can use this callback to determine how specifically to decode something.
-	// A simple implementation exists which just uses some options to do it 
-	// (see SimpleDecoderContainerResolver).
-	DecoderContainer(parentcontainer reflect.Value, parentkey interface{}, 
-		length int, ct ContainerType) (val reflect.Value)
+type decExtTagFn struct {
+	fn func(reflect.Value, []byte)(error)
+	tag byte
 }
 
-// SimpleDecoderContainerResolver is a simple DecoderContainerResolver
-// which uses some simple options to determine how to decode into a nil interface{}.
-// Most applications will work fine with just this.
-type SimpleDecoderContainerResolver struct {
-	// If decoding into a nil interface{} and we detect a map in the stream,
-	// we create a map of the type specified. It defaults to creating a 
-	// map[interface{}]interface{} if not specified. 
+type decExtTypeTagFn struct {
+	rt reflect.Type
+	decExtTagFn
+}
+
+type DecoderOptions struct {
+	// MapType determines how we initialize a map that we detect in the stream,
+	// when decoding into a nil interface{}.
 	MapType reflect.Type
-	// If decoding into a nil interface{} and we detect a slice/array in the stream,
-	// we create a slice of the type specified. It defaults to creating a 
-	// []interface{} if not specified. 
+	// SliceType controls how we initializa a slice that we detect in the stream,
+	// when decoding into a nil interface{}.
 	SliceType reflect.Type
-	// convert to a string if raw bytes are detected while decoding 
-	// into a interface{},
-	BytesStringLiteral bool
-	// convert to a string if raw bytes are detected while decoding 
-	// into a []interface{},
-	BytesStringSliceElement bool
-	// convert to a string if raw bytes are detected while decoding 
-	// into a value in a map[XXX]interface{},
-	BytesStringMapValue bool
+	// RawToString controls how raw bytes are decoded into a nil interface{}.
+	// Note that setting an extension func for []byte ensures that raw bytes are decoded as strings,
+	// regardless of this setting. This setting is used only if an extension func isn't defined for []byte.
+	RawToString bool
+
+	// if an extension for byte slice is defined, then always decode Raw as strings
+	rawToStringOverride bool
+	exts []decExtTypeTagFn
+	extFuncs map[reflect.Type] decExtTagFn
 }
 
-// DecoderContainer supports common cases for decoding into a nil 
-// interface{} depending on the context.
-// 
-// When decoding into a nil interface{}, the following rules apply as we have 
-// to make assumptions about the specific types you want.
-//    - Maps are decoded as map[interface{}]interface{} 
-//      unless you provide a default map type when creating your decoder.
-//      option: MapType
-//    - Lists are always decoded as []interface{}
-//      unless you provide a default slice type when creating your decoder.
-//      option: SliceType
-//    - raw bytes are decoded into []byte or string depending on setting of:
-//      option: BytesStringMapValue     (if within a map value, use this setting)
-//      option: BytesStringSliceElement (else if within a slice, use this setting)
-//      option: BytesStringLiteral      (else use this setting)
-func (d SimpleDecoderContainerResolver) DecoderContainer(
-	parentcontainer reflect.Value, parentkey interface{}, 
-	length int, ct ContainerType) (rvn reflect.Value) {
-	switch ct {
-	case ContainerMap:
-		if d.MapType != nil {
-			rvn = reflect.MakeMap(d.MapType)
-		} else {
-			rvn = reflect.MakeMap(mapIntfIntfTyp)
-		}
-	case ContainerList:
-		if d.SliceType != nil {
-			rvn = reflect.MakeSlice(d.SliceType, length, length)
-		} else {
-			rvn = reflect.MakeSlice(intfSliceTyp, length, length)
-		}
-	case ContainerRawBytes:
-		rk := parentcontainer.Kind()
-		if (rk == reflect.Invalid && d.BytesStringLiteral) ||
-			(rk == reflect.Slice && d.BytesStringSliceElement) ||
-			(rk == reflect.Map && d.BytesStringMapValue) {
-			rvm := ""
-			rvn = reflect.ValueOf(&rvm)
-		} else {
-			rvn = reflect.MakeSlice(byteSliceTyp, length, length)
+// Creates a new DecoderOptions with:
+//   MapType: map[interface{}]interface{} 
+//   SliceType: []interface{}
+//   RawToString: true
+func NewDecoderOptions() (*DecoderOptions) {
+	o := DecoderOptions{
+		MapType: mapIntfIntfTyp,
+		SliceType: intfSliceTyp,
+		RawToString: true,
+		exts: make([]decExtTypeTagFn, 0, 1),
+		extFuncs: make(map[reflect.Type]decExtTagFn, 8),
+	}
+	return &o
+}
+
+// AddExt registers a function to handle decoding into a given type when an extension type 
+// and specific tag byte is detected in the msgpack stream. 
+// To remove an extension, pass fn=nil.
+func (o *DecoderOptions) AddExt(rt reflect.Type, tag byte, fn func(reflect.Value, []byte) (error)) {
+	if _, ok := o.extFuncs[rt]; ok {
+		delete(o.extFuncs, rt)
+		if rt == byteSliceTyp {
+			o.rawToStringOverride = false
 		}
 	}
-	// fmt.Printf("DecoderContainer: %T, %v\n", rvn.Interface(), rvn.Interface())
+	if fn != nil {
+		o.extFuncs[rt] = decExtTagFn{fn, tag}
+		if rt == byteSliceTyp {
+			o.rawToStringOverride = true
+		}
+	}
+	
+	if leno := len(o.extFuncs); leno > cap(o.exts) {
+		o.exts = make([]decExtTypeTagFn, leno, (leno * 3 / 2))
+	} else {
+		o.exts = o.exts[0:leno]
+	}
+	var i int
+	for k, v := range o.extFuncs {
+		o.exts[i] = decExtTypeTagFn {k, v}
+		i++
+	}
+}
+
+func (o *DecoderOptions) typeForTag(tag byte) reflect.Type {
+	for _, x := range o.exts {
+		if x.tag == tag {
+			return x.rt
+		}
+	}
+	return nil
+}
+
+func (o *DecoderOptions) tagFnForType(rt reflect.Type) (xfn decExtTagFn) {
+	// For >= 4 elements, map outways cost of iteration.
+	if len(o.exts) > 3 {
+		return o.extFuncs[rt]
+	}
+	for _, x := range o.exts {
+		if x.rt == rt {
+			return x.decExtTagFn
+		}
+	}
 	return
 }
 
 // NewDecoder returns a Decoder for decoding a stream of bytes into an object.
-// If nil DecoderContainerResolver is passed, we use DefaultDecoderContainerResolver
-func NewDecoder(r io.Reader, dam DecoderContainerResolver) (d *Decoder) {
-	if dam == nil {
-		dam = &DefaultDecoderContainerResolver
+func NewDecoder(r io.Reader, o *DecoderOptions) (d *Decoder) {
+	if o == nil {
+		o = NewDecoderOptions()
 	}
-	d = &Decoder{r:r, dam:dam}
+	d = &Decoder{ r:r, bdRead: false, opts: o }
 	d.t1, d.t2, d.t4, d.t8 = d.x[:1], d.x[:2], d.x[:4], d.x[:8]
 	return
 }
 
 // Decode decodes the stream from reader and stores the result in the 
-// value pointed to by v.
+// value pointed to by v. v cannot be a nil pointer. v can also be 
+// a reflect.Value of a pointer.
 // 
-// If v is a pointer to a non-nil value, we will decode the stream into that value 
-// (if the value type and the stream match. For example:
-// integer in stream must go into int type (int8...int64), etc
-// 
+// Note that a pointer to a nil interface is not a nil pointer.
 // If you do not know what type of stream it is, pass in a pointer to a nil interface.
 // We will decode and store a value in that nil interface. 
-// 
-// time.Time is handled transparently, by (en)decoding (to)from a 
-// []int64{Seconds since Epoch, Nanoseconds offset}.
 // 
 // Sample usages:
 //   // Decoding into a non-nil typed value
@@ -213,470 +185,642 @@ func NewDecoder(r io.Reader, dam DecoderContainerResolver) (d *Decoder) {
 //   dec := msgpack.NewDecoder(r, nil)
 //   err = dec.Decode(&v)
 //   
-//   // To configure default options, see DefaultDecoderContainerResolver usage.
-//   // or write your own DecoderContainerResolver
 func (d *Decoder) Decode(v interface{}) (err error) {
-	return d.DecodeValue(reflectValue(v))
-}
-
-// DecodeValue decodes the stream into a reflect.Value.
-// The reflect.Value must be a pointer.
-// See Decoder.Decode documentation. (Decode internally calls DecodeValue).
-func (d *Decoder) DecodeValue(rv reflect.Value) (err error) {
 	defer panicToErr(&err)
-	// We cannot marshal into a non-pointer or a nil pointer 
-	// (at least pass a nil interface so we can marshal into it)
-	if rv.Kind() != reflect.Ptr || rv.IsNil() {
-		var rvi interface{} = rv
-		if rv.IsValid() && rv.CanInterface() {
-			rvi = rv.Interface()
-		}
-		err = fmt.Errorf("%v: DecodeValue: Expecting valid pointer to decode into. Got: %v, %T, %v",
-			msgTagDec, rv.Kind(), rvi, rvi)
-		return
-	}
-
-	//if a nil pointer is passed, set rv to the underlying value (not pointer).
-	d.decodeValueT(0, -1, true, rv.Elem(), true, true, true)
+	d.decode(v)
 	return
 }
 
-func (d *Decoder) decodeValueT(bd byte, containerLen int, readDesc bool, rve reflect.Value, 
-	checkWasNilIntf bool, dereferencePtr bool, setToRealValue bool) (rvn reflect.Value) {
-	rvn = rve
-	wasNilIntf, rv := d.decodeValue(bd, containerLen, readDesc, rve)
-	//if wasNilIntf, rv is either a pointer to actual value, a map or slice, or nil/invalid
-	if ((checkWasNilIntf && wasNilIntf) || !checkWasNilIntf) && rv.IsValid() {
-		if dereferencePtr && rv.Kind() == reflect.Ptr {
-			rv = rv.Elem()
-		}
-		if setToRealValue {
-		   rve.Set(rv)
-		}
-		rvn = rv
-	}
-	return
-}
-
-func (d *Decoder) nilIntfDecode(bd0 byte, containerLen0 int, readDesc bool, setContainers bool, rv0 reflect.Value) (
-	rv reflect.Value, bd byte, ct ContainerType, containerLen int, handled bool) {
-	rv, bd, containerLen = rv0, bd0, containerLen0
-	if readDesc {
-		d.readb(1, d.t1)
-		bd = d.t1[0]
-	}
-	//if we set the reflect.Value to an primitive value, consider it handled and return.
-	handled = true
-	switch {
-	case bd == 0xc0:
-	case bd == 0xc2:
-		rv.Set(reflect.ValueOf(false))
-	case bd == 0xc3:
-		rv.Set(reflect.ValueOf(true))
-
-	case bd == 0xca:
-		rv.Set(reflect.ValueOf(math.Float32frombits(d.readUint32())))
-	case bd == 0xcb:
-		rv.Set(reflect.ValueOf(math.Float64frombits(d.readUint64())))
-		
-	case bd == 0xcc:
-		rv.Set(reflect.ValueOf(d.readUint8()))
-	case bd == 0xcd:
-		rv.Set(reflect.ValueOf(d.readUint16()))
-	case bd == 0xce:
-		rv.Set(reflect.ValueOf(d.readUint32()))
-	case bd == 0xcf:
-		rv.Set(reflect.ValueOf(d.readUint64()))
-		
-	case bd == 0xd0:
-		rv.Set(reflect.ValueOf(int8(d.readUint8())))
-	case bd == 0xd1:
-		rv.Set(reflect.ValueOf(int16(d.readUint16())))
-	case bd == 0xd2:
-		rv.Set(reflect.ValueOf(int32(d.readUint32())))
-	case bd == 0xd3:
-		rv.Set(reflect.ValueOf(int64(d.readUint64())))
-
-	case bd == 0xda, bd == 0xdb, bd >= 0xa0 && bd <= 0xbf:
-		ct = ContainerRawBytes
-		if containerLen < 0 {
-			containerLen = d.readContainerLen(bd, false, ct)
-		}
-		if setContainers {
-			rv.Set(d.dam.DecoderContainer(reflect.Value{}, nil, containerLen, ct))
-			rv = rv.Elem()
-		}
-		handled = false
-	case bd == 0xdc, bd == 0xdd, bd >= 0x90 && bd <= 0x9f:
-		ct = ContainerList
-		if containerLen < 0 {
-			containerLen = d.readContainerLen(bd, false, ct)
-		}
-		if setContainers {
-			rv.Set(d.dam.DecoderContainer(reflect.Value{}, nil, containerLen, ct))
-		}
-		handled = false
-	case bd == 0xde, bd == 0xdf, bd >= 0x80 && bd <= 0x8f:
-		ct = ContainerMap
-		if containerLen < 0 {
-			containerLen = d.readContainerLen(bd, false, ct)
-		}
-		if setContainers {
-			rv.Set(d.dam.DecoderContainer(reflect.Value{}, nil, containerLen, ct))
-		}
-		handled = false
-	case bd >= 0xe0 && bd <= 0xff, bd >= 0x00 && bd <= 0x7f:
-		// FIXNUM
-		rv.Set(reflect.ValueOf(int8(bd)))
-	default:
-		handled = false
-		d.err("Nil-Deciphered DecodeValue: %s: hex: %x, dec: %d", msgBadDesc, bd, bd)
-	}
-	return
-}
-
-func (d *Decoder) decodeValue(bd byte, containerLen int, readDesc bool, rv0 reflect.Value) (
-	wasNilIntf bool, rv reflect.Value) {
-	//log(".. enter decode: rv: %v, %T, %v", rv0, rv0.Interface(), rv0.Interface())
-	//defer func() {
-	//	log("..  exit decode: rv: %v, %T, %v", rv, rv.Interface(), rv.Interface())
-	//}()
+func (d *Decoder) decode(iv interface{}) {
+	d.ensureBdRead()
 	
-	rv = rv0
-	if readDesc {
-		d.readb(1, d.t1)
-		bd = d.t1[0]
+	switch v := iv.(type) {
+	case nil:
+		d.err("Cannot decode into nil.")
+	case reflect.Value:
+		d.chkPtrValue(v)
+		d.decodeValue(v)
+	case *string:
+		*v = d.decodeString()
+	case *[]byte:
+		if bs2, changed2 := d.decodeBytes(*v); changed2 {
+			*v = bs2
+		}
+	case *bool:
+		*v = d.decodeBool()
+	case *int:
+		*v = int(d.decodeInt(intBitsize))
+	case *int8:
+		*v = int8(d.decodeInt(8))
+	case *int16:
+		*v = int16(d.decodeInt(16))
+	case *int32:
+		*v = int32(d.decodeInt(32))
+	case *int64:
+		*v = int64(d.decodeInt(64))
+	case *uint:
+		*v = uint(d.decodeUint(uintBitsize))
+	case *uint8:
+		*v = uint8(d.decodeUint(8))
+	case *uint16:
+		*v = uint16(d.decodeUint(16))
+	case *uint32:
+		*v = uint32(d.decodeUint(32))
+	case *uint64:
+		*v = uint64(d.decodeUint(64))
+	case *float32:
+		*v = float32(d.decodeFloat(true))
+	case *float64:
+		*v = d.decodeFloat(false) 
+	case *interface{}:
+	 	d.decodeValue(reflect.ValueOf(iv).Elem())
+	default:
+		rv := reflect.ValueOf(iv)
+		d.chkPtrValue(rv)
+		d.decodeValue(rv)
+	}	
+}
+
+
+// Note: This returns either a primitive (int, bool, etc) for non-containers,
+// or a containerType, or a specific type denoting nil or extension. 
+// It is called when a nil interface{} is passed, leaving it up to the Decoder
+// to introspect the stream and decide how best to decode.
+// It deciphers the value by looking at the stream first.
+func (d *Decoder) decodeNaked() (v interface{}) {
+	d.ensureBdRead()
+	bd := d.bd
+
+	switch bd {
+	case 0xc0:
+		v = decNil{}
+	case 0xc2:
+		v = false
+	case 0xc3:
+		v = true
+
+	case 0xca:
+		v = math.Float32frombits(d.readUint32())
+	case 0xcb:
+		v = math.Float64frombits(d.readUint64())
+		
+	case 0xcc:
+		v = d.readUint8()
+	case 0xcd:
+		v = d.readUint16()
+	case 0xce:
+		v = d.readUint32()
+	case 0xcf:
+		v = d.readUint64()
+		
+	case 0xd0:
+		v = int8(d.readUint8())
+	case 0xd1:
+		v = int16(d.readUint16())
+	case 0xd2:
+		v = int32(d.readUint32())
+	case 0xd3:
+		v = int64(d.readUint64())
+		
+	default:
+		switch {
+		case bd >= 0xe0 && bd <= 0xff, bd >= 0x00 && bd <= 0x7f:
+			// fixnum
+			v = int8(bd)
+			
+		case bd == 0xda, bd == 0xdb, bd >= 0xa0 && bd <= 0xbf:
+			v = containerRawBytes
+		case bd == 0xdc, bd == 0xdd, bd >= 0x90 && bd <= 0x9f:
+			v = containerList
+		case bd == 0xde, bd == 0xdf, bd >= 0x80 && bd <= 0x8f:
+			v = containerMap
+
+		case bd >= 0xc4 && bd <= 0xc9, bd >= 0xd4 && bd <= 0xd9:
+			v = decExt{}
+			
+		default:
+			d.err("Nil-Deciphered DecodeValue: %s: hex: %x, dec: %d", msgBadDesc, bd, bd)
+		}
 	}
+	return
+}
 
+func (d *Decoder) decodeValue(rv reflect.Value) {
+	// Note: if stream is set to nil (0xc0), we set the corresponding value to its "zero" value
+	
+	// var ctr int (define this above the  function if trying to do this run)
+	// ctr++
+	// log(".. [%v] enter decode: rv: %v <==> %T <==> %v", ctr, rv, rv.Interface(), rv.Interface())
+	// defer func(ctr2 int) {
+	// 	log(".... [%v] exit decode: rv: %v <==> %T <==> %v", ctr2, rv, rv.Interface(), rv.Interface())
+	// }(ctr)
+	d.ensureBdRead()
+	
+	rvOrig := rv
 	rk := rv.Kind()
-	wasNilIntf = rk == reflect.Interface && rv.IsNil()
-
+	wasNilIntf := rk == reflect.Interface && rv.IsNil()
+	var xtagRead bool
+	var rt reflect.Type
+	
 	//if nil interface, use some hieristics to set the nil interface to an 
 	//appropriate value based on the first byte read (byte descriptor bd)
 	if wasNilIntf {
-		var handled bool
-		rv, bd, _, containerLen, handled = d.nilIntfDecode(bd, containerLen, false, true, rv)
-		if handled {
+		v := d.decodeNaked()
+		switch v2 := v.(type) {
+		case containerType:
+			switch v2 {
+			case containerRawBytes:
+				if d.opts.rawToStringOverride || d.opts.RawToString {
+					var rvm string
+					rv = reflect.ValueOf(&rvm).Elem()
+				} else {
+					rv = reflect.New(byteSliceTyp).Elem() // Use New, not Zero, so it's settable
+				}
+			case containerList:
+				rv = reflect.New(d.opts.SliceType).Elem()
+			case containerMap:
+				rv = reflect.MakeMap(d.opts.MapType)
+			default:
+				d.err("Unknown container type: %v", v2)
+			}
+			rk = rv.Kind()
+			rt = rv.Type()
+		case decNil:
+			d.bdRead = false
+			rt = rv.Type()
+		case decExt:
+			xtag := d.readUint8()
+			xtagRead = true
+			if rt = d.opts.typeForTag(xtag); rt != nil {
+				if rt.Kind() == reflect.Ptr {
+					rv = reflect.New(rt.Elem())
+				} else {
+					rv = reflect.New(rt).Elem()
+				}
+				break
+			} 
+			d.err("Unable to find type mapped to extension tag: %v", xtag)
+		default:
+			// all low level primitives ... 
+			rvOrig.Set(reflect.ValueOf(v))
+			d.bdRead = false
 			return
 		}
-		rk = rv.Kind()
 	}
 	
-	if bd == 0xc0 {
-		rv.Set(reflect.Zero(rv.Type()))	
-		//log("==   nil decode: rv: %v, %v", rv, rv.Interface())
+	if rt == nil {
+		rt = rv.Type()
+	}
+	if d.bd == 0xc0 {
+		d.bdRead = false
+		// log("decoding value as nil: %v", rt)
+		rv.Set(reflect.Zero(rt))
 		return
 	}
 	
-	// cases are arranged in sequence of most probable ones
-	switch rk {
-	default:
-		// handles numeral and bool values
-		switch bd {
-		case 0xc2:
-			rv.SetBool(false)
-		case 0xc3:
-			rv.SetBool(true)
-			
-		case 0xca:
-			rv.SetFloat(float64(math.Float32frombits(d.readUint32())))
-		case 0xcb:
-			rv.SetFloat(math.Float64frombits(d.readUint64()))
-			
-		default:
-			d.err("Unhandled single-byte value: %s: %x", msgBadDesc, bd)
-		}
-	case reflect.String:
-		if containerLen < 0 {
-			containerLen = d.readContainerLen(bd, false, ContainerRawBytes)
-		}
-		if containerLen == 0 {
-			break
-		}		
-		bs := make([]byte, containerLen)
-		d.readb(containerLen, bs)
-		rv.SetString(string(bs))
-	case reflect.Slice:
-		rvtype := rv.Type()
-		rawbytes := rvtype == byteSliceTyp
-		
-		if containerLen < 0 {
-			if rawbytes {
-				containerLen = d.readContainerLen(bd, false, ContainerRawBytes)
-			} else {
-				containerLen = d.readContainerLen(bd, false, ContainerList)
-			} 
-		}
-		if containerLen == 0 {
-			break
-		}
-		
-		if rawbytes {
-			var bs []byte= rv.Bytes()
-			rvlen := len(bs)
-			if rvlen == containerLen {
-			} else if rvlen > containerLen {
-				bs = bs[:containerLen]
-			} else {
-				bs = make([]byte, containerLen)
-				rv.Set(reflect.ValueOf(bs))
+	// check extensions:
+	// quick check first to see if byte desc matches (since checking maps expensive).
+	// We do this here, because an extension can be registered for any type, regardless of the 
+	// Kind (e.g. type BitSet int64, type MyStruct { /* unexported fields */ }, type X []int, etc.
+	
+	// We cannot check stream bytes here, because the current value may be a pointer,
+	// whereas the user registered the non-pointer type (so when we call recursive func again, it works).
+	// if (d.bd >= 0xc4 && d.bd <= 0xc9) || (d.bd >= 0xd4 && d.bd <= 0xd9) {
+	// }
+	if bfn := d.opts.tagFnForType(rt); bfn.fn != nil {
+		if !xtagRead {
+			xtag := d.readUint8()
+			if bfn.tag != xtag {
+				d.err("Wrong extension tag: %b, found for type: %v. Expecting: %v", xtag, rt, bfn.tag)
 			}
-			d.readb(containerLen, bs)
+		}
+		clen := d.readExtLen()
+		xbs := make([]byte, clen)
+		d.readb(clen, xbs)
+		if fnerr := bfn.fn(rv, xbs); fnerr != nil {
+			panic(fnerr)
+		}
+		d.bdRead = false
+		if wasNilIntf {
+			rvOrig.Set(rv)
+		}
+		return
+	}
+	
+	// use this variable and function to reset rv if necessary.
+	var rvn reflect.Value
+	rvReset := func() {
+		if wasNilIntf {
+			rv = rvn
+		} else {
+			rv.Set(rvn)
+		}
+	}
+	
+	// (Mar 7, 2013. DON'T REARRANGE ... code clarity)
+	// tried arranging in sequence of most probable ones. 
+	// string, bool, integer, float, struct, ptr, slice, array, map, interface, uint.
+	switch rk {
+	case reflect.String:
+		rv.SetString(d.decodeString())
+	case reflect.Bool:
+		rv.SetBool(d.decodeBool())
+	case reflect.Int:
+		rv.SetInt(d.decodeInt(intBitsize))
+	case reflect.Int64:
+		rv.SetInt(d.decodeInt(64))
+	case reflect.Int32:
+		rv.SetInt(d.decodeInt(32))
+	case reflect.Int8:
+		rv.SetInt(d.decodeInt(8))
+	case reflect.Int16:
+		rv.SetInt(d.decodeInt(16))
+	case reflect.Float32:
+		rv.SetFloat(d.decodeFloat(true))
+	case reflect.Float64:
+		rv.SetFloat(d.decodeFloat(false))
+	case reflect.Uint8:
+		rv.SetUint(d.decodeUint(8))
+	case reflect.Uint64: 
+		rv.SetUint(d.decodeUint(64))
+	case reflect.Uint:
+		rv.SetUint(d.decodeUint(uintBitsize))
+	case reflect.Uint32:
+		rv.SetUint(d.decodeUint(32))
+	case reflect.Uint16:
+		rv.SetUint(d.decodeUint(16))
+	case reflect.Ptr:
+		if rv.IsNil() {
+			rvn = reflect.New(rt.Elem())
+			rvReset()
+		}
+		d.decodeValue(rv.Elem())
+	case reflect.Interface:
+		d.decodeValue(rv.Elem())
+	case reflect.Struct:
+		containerLen := d.readContainerLen(containerMap)
+		d.bdRead = false
+		
+		// if stream had nil, reset the struct
+		if containerLen < 0 {
+			rvn = reflect.Zero(rt)
+			rvReset()
+			break
+		} 
+		if containerLen == 0 {
+			break
+		}
+		
+		sfi := getStructFieldInfos(rt)
+		for j := 0; j < containerLen; j++ {
+			var rvkencname string
+			d.decode(&rvkencname)
+			rvksi := sfi.getForEncName(rvkencname)
+			if rvksi == nil {
+				var nilintf0 interface{}
+				d.decodeValue(reflect.ValueOf(&nilintf0).Elem())
+			} else { 
+				d.decodeValue(rvksi.field(rv))
+			}
+		}
+	case reflect.Slice:
+		if rt == byteSliceTyp { // rawbytes 
+			if bs2, changed2 := d.decodeBytes(rv.Bytes()); changed2 {
+				rv.SetBytes(bs2)
+			}
+			break			
+		}
+		
+		containerLen := d.readContainerLen(containerList)
+		d.bdRead = false
+
+		if containerLen < 0 {
+			rvn = reflect.Zero(rt)
+			rvReset()
+			break
+		}
+		if containerLen == 0 {
 			break
 		}
 		
 		if rv.IsNil() {
-			rv.Set(reflect.MakeSlice(rvtype, containerLen, containerLen))
+			rvn = reflect.MakeSlice(rt, containerLen, containerLen)
+			rvReset()
 		} else {
 			rvlen := rv.Len()
 			if containerLen > rv.Cap() {
-				rv2 := reflect.MakeSlice(rvtype, containerLen, containerLen)
+				rvn = reflect.MakeSlice(rt, containerLen, containerLen)
 				if rvlen > 0 {
-					reflect.Copy(rv2, rv)
+					reflect.Copy(rvn, rv)
 				}
-				rv.Set(rv2)
+				rvReset()
 			} else if containerLen > rvlen {
 				rv.SetLen(containerLen)
 			}
-		}		
-		d.decodeValuePostList(rv, containerLen, rvtype.Elem() == intfTyp)
+		}
+
+		for j := 0; j < containerLen; j++ {
+			d.decodeValue(rv.Index(j))
+		}
 	case reflect.Array:
-		rvtype := rv.Type()
 		rvlen := rv.Len()
-		rawbytes := rvlen > 0 && rv.Index(0).Kind() == reflect.Uint8
-		
-		if containerLen < 0 {
-			if rawbytes {
-				containerLen = d.readContainerLen(bd, false, ContainerRawBytes)
-			} else {
-				containerLen = d.readContainerLen(bd, false, ContainerList)
-			} 
-		}
-		if containerLen == 0 {
-			break
-		}
-		
-		if rawbytes {
+		rvelemtype := rt.Elem()
+		rvelemkind := rvelemtype.Kind()
+		if rvelemkind == reflect.Uint8 { // rawbytes
+			containerLen := d.readContainerLen(containerRawBytes)
 			var bs []byte = rv.Slice(0, rvlen).Bytes()
-			if rvlen == containerLen {
+			if containerLen < 0 {
+				// clear
+				for j := 0; j < rvlen; j++ {
+					bs[j] = 0
+				}
+			} else if containerLen == 0 {
+			} else if rvlen == containerLen {
 				d.readb(containerLen, bs)
 			} else if rvlen > containerLen {
 				d.readb(containerLen, bs[:containerLen])
 			} else {
 				d.err("Array len: %d must be >= container Len: %d", rvlen, containerLen)
 			} 
+			d.bdRead = false
 			break
 		}
 		
-		rvelemtype := rvtype.Elem()
+		containerLen := d.readContainerLen(containerList)
+		d.bdRead = false
+		if containerLen == 0 {
+			break
+		}
+		if containerLen < 0 {
+			containerLen = 0
+		}
 		if rvlen < containerLen {
 			d.err("Array len: %d must be >= container Len: %d", rvlen, containerLen)
 		} else if rvlen > containerLen {
+			rvelemzero := reflect.Zero(rvelemtype)
 			for j := containerLen; j < rvlen; j++ {
-				rv.Index(j).Set(reflect.Zero(rvelemtype))
+				rv.Index(j).Set(rvelemzero)
 			}
 		}
-		d.decodeValuePostList(rv, containerLen, rvelemtype == intfTyp)
-	case reflect.Struct:
-		rvtype := rv.Type()
-		if rvtype == timeTyp {
-			tt := [2]int64{}
-			d.decodeValue(bd, -1, false, reflect.ValueOf(&tt).Elem())
-			rv.Set(reflect.ValueOf(time.Unix(tt[0], tt[1]).UTC()))
+		
+		for j := 0; j < containerLen; j++ {
+			d.decodeValue(rv.Index(j))
+		}
+	case reflect.Map:
+		containerLen := d.readContainerLen(containerMap)
+		d.bdRead = false
+		
+		if containerLen == 0 {
+			break
+		}
+		if containerLen < 0 {
+			rvn = reflect.Zero(rt)
+			rvReset()
 			break
 		}
 		
-		if containerLen < 0 {
-			containerLen = d.readContainerLen(bd, false, ContainerMap)
-		}
-		if containerLen == 0 {
-			break
-		}
-		for j := 0; j < containerLen; j++ {
-			rvkencname := ""
-			rvk := reflect.ValueOf(&rvkencname).Elem()
-			d.decodeValue(0, -1, true, rvk)
-			rvksi := getStructFieldInfos(rvtype).getForEncName(rvkencname)
-			if rvksi == nil {
-				// d.err("DecodeValue: Invalid Enc Field: %s", rvkencname) (skip it)
-				var nilintf0 interface{}
-				d.decodeValueT(0, -1, true, reflect.ValueOf(&nilintf0), true, true, true)
-			} else {
-				d.decodeValueT(0, -1, true, rvksi.field(rv), true, true, true)
-			}
-		}
-	case reflect.Map:
-		if containerLen < 0 {
-			containerLen = d.readContainerLen(bd, false, ContainerMap)
-		}
-		if containerLen == 0 {
-			break
-		}
-		rvtype := rv.Type()
-		ktype, vtype := rvtype.Key(), rvtype.Elem()			
 		if rv.IsNil() {
-			rvn := reflect.MakeMap(rvtype)
-			rv.Set(rvn)
+			rvn = reflect.MakeMap(rt)
+			rvReset()
 		}
+		ktype, vtype := rt.Key(), rt.Elem()			
 		for j := 0; j < containerLen; j++ {
 			rvk := reflect.New(ktype).Elem()
-			rvk = d.decodeValueT(0, -1, true, rvk, true, true, false)
+			d.decodeValue(rvk)
 			
-			if ktype == intfTyp && rvk.Type() == byteSliceTyp {
-				rvk = reflect.ValueOf(string(rvk.Bytes()))
+			if ktype == intfTyp {
+				rvk = rvk.Elem()
+				if rvk.Type() == byteSliceTyp {
+					rvk = reflect.ValueOf(string(rvk.Bytes()))
+				}
 			}
 			rvv := rv.MapIndex(rvk)
 			if !rvv.IsValid() {
 				rvv = reflect.New(vtype).Elem()
 			}
-			if vtype == intfTyp && rvv.IsNil() {
-				rvv, bd0, ct0, containerLen0, handled0 := d.nilIntfDecode(0, -1, true, false, rvv)
-				if !handled0 {
-					if rvv2 := d.dam.DecoderContainer(rv, rvk, containerLen0, ct0); rvv2.IsValid() {
-						rvv2 = d.decodeValueT(bd0, containerLen0, false, rvv2, false, true, false)
-						rvv.Set(rvv2)
-					} else {
-						rvv = d.decodeValueT(bd0, containerLen0, false, rvv, true, true, false)
-					}
-				}
-			} else {
-				rvv = d.decodeValueT(0, -1, true, rvv, true, true, false)
-			}
+			
+			d.decodeValue(rvv)
 			rv.SetMapIndex(rvk, rvv)
 		}
-	case reflect.Ptr:
-		if rv.IsNil() {
-			rv.Set(reflect.New(rv.Type().Elem()))
-		}
-		d.decodeValue(bd, containerLen, false, rv.Elem())
-	case reflect.Interface:
-		d.decodeValue(bd, containerLen, false, rv.Elem())
-	case reflect.Int, reflect.Int64, reflect.Int32, reflect.Int8, reflect.Int16:
-		i, _ := d.decodeInteger(bd, true)
-		if rv.OverflowInt(i) {
-			d.err("Overflow int value: %v into kind: %v", i, rk)
-		} else {
-			rv.SetInt(i)
-		}
-	case reflect.Uint8, reflect.Uint64, reflect.Uint, reflect.Uint32, reflect.Uint16:
-		_, ui := d.decodeInteger(bd, false)
-		if rv.OverflowUint(ui) {
-			d.err("Overflow unsigned int value: %v into kind: %v", ui, rk)
-		} else {
-			rv.SetUint(ui)
-		}
+	default:
+		d.err("Unhandled single-byte value: %s: %x", msgBadDesc, d.bd)
 	}
+	
+	if wasNilIntf {
+		// if setToIndir { rvOrig.Set(rv.Elem()) } else { rvOrig.Set(rv) }
+		rvOrig.Set(rv)
+	}
+
 	return
 }
 
-func (d *Decoder) decodeValuePostList(rv reflect.Value, containerLen int, elemIsIntf bool) {
-	for j := 0; j < containerLen; j++ {
-		rvj := rv.Index(j)
-		if elemIsIntf && rvj.IsNil() {
-			rvj, bd0, ct0, containerLen0, handled0 := d.nilIntfDecode(0, -1, true, false, rvj)
-			// fmt.Printf("intfTyp: %v, %v, %v, %v, %v\n", rvj.Interface(), bd0, ct0, containerLen0, handled0)
-			if !handled0 {
-				if rvj2 := d.dam.DecoderContainer(rv, j, containerLen0, ct0); rvj2.IsValid() {
-					rvj2 = d.decodeValueT(bd0, containerLen0, false, rvj2, false, true, false)
-					rvj.Set(rvj2)
-				} else {
-					d.decodeValueT(bd0, containerLen0, false, rvj, true, true, true)
-				}
-			}
-		} else {
-			d.decodeValueT(0, -1, true, rvj, true, true, true)
+// int can be decoded from msgpack type: intXXX or uintXXX 
+func (d *Decoder) decodeInt(bitsize uint8) (i int64) {
+	switch d.bd {
+	case 0xcc:
+		i = int64(uint64(d.readUint8()))
+	case 0xcd:
+		i = int64(uint64(d.readUint16()))
+	case 0xce:
+		i = int64(uint64(d.readUint32()))
+	case 0xcf:
+		i = int64(d.readUint64())
+	case 0xd0:
+		i = int64(int8(d.readUint8()))
+	case 0xd1:
+		i = int64(int16(d.readUint16()))
+	case 0xd2:
+		i = int64(int32(d.readUint32()))
+	case 0xd3:
+		i = int64(d.readUint64())
+	default:
+		switch {
+		case d.bd >= 0x00 && d.bd <= 0x7f:
+			i = int64(int8(d.bd))
+		case d.bd >= 0xe0 && d.bd <= 0xff:
+			i = int64(int8(d.bd))
+		default:
+			d.err("Unhandled single-byte unsigned integer value: %s: %x", msgBadDesc, d.bd)
 		}
 	}
+	// check overflow (logic adapted from std pkg reflect/value.go OverflowUint()
+	if bitsize > 0 {
+		if trunc := (i << (64 - bitsize)) >> (64 - bitsize); i != trunc {
+			d.err("Overflow int value: %v", i)
+		}
+	}
+	d.bdRead = false
+	return
 }
-	
-// decode an integer from the stream
-func (d *Decoder) decodeInteger(bd byte, sign bool) (i int64, ui uint64) {
-	switch {
-	case bd == 0xcc:
+
+
+// uint can be decoded from msgpack type: intXXX or uintXXX 
+func (d *Decoder) decodeUint(bitsize uint8) (ui uint64) {
+	switch d.bd {
+	case 0xcc:
 		ui = uint64(d.readUint8())
-		if sign {
-			i = int64(ui)
-		}
-	case bd == 0xcd:
+	case 0xcd:
 		ui = uint64(d.readUint16())
-		if sign {
-			i = int64(ui)
-		}
-	case bd == 0xce:
+	case 0xce:
 		ui = uint64(d.readUint32())
-		if sign {
-			i = int64(ui)
-		}
-	case bd == 0xcf:
+	case 0xcf:
 		ui = d.readUint64()
-		if sign {
-			i = int64(ui)
-		}
-
-	case bd == 0xd0:
-		i = int64(int8(d.readUint8()))
-		if !sign {
-			if i >= 0 {
-				ui = uint64(i)
-			} else {
-				d.err("Assigning negative signed value: %v, to unsigned type", i)
-			}
-		}
-	case bd == 0xd1:
-		i = int64(int16(d.readUint16()))
-		if !sign {
-			if i >= 0 {
-				ui = uint64(i)
-			} else {
-				d.err("Assigning negative signed value: %v, to unsigned type", i)
-			}
-		}
-	case bd == 0xd2:
-		i = int64(int32(d.readUint32()))
-		if !sign {
-			if i >= 0 {
-				ui = uint64(i)
-			} else {
-				d.err("Assigning negative signed value: %v, to unsigned type", i)
-			}
-		}
-	case bd == 0xd3:
-		i = int64(d.readUint64())
-		if !sign {
-			if i >= 0 {
-				ui = uint64(i)
-			} else {
-				d.err("Assigning negative signed value: %v, to unsigned type", i)
-			}
-		}
-
-	case bd >= 0x00 && bd <= 0x7f:
-		if sign {
-			i = int64(int8(bd))
+	case 0xd0:
+		i := int64(int8(d.readUint8()))
+		if i >= 0 {
+			ui = uint64(i)
 		} else {
-			ui = uint64(bd)
+			d.err("Assigning negative signed value: %v, to unsigned type", i)
 		}
-	case bd >= 0xe0 && bd <= 0xff:
-		i = int64(int8(bd))
-		if !sign {
+	case 0xd1:
+		i := int64(int16(d.readUint16()))
+		if i >= 0 {
+			ui = uint64(i)
+		} else {
+			d.err("Assigning negative signed value: %v, to unsigned type", i)
+		}
+	case 0xd2:
+		i := int64(int32(d.readUint32()))
+		if i >= 0 {
+			ui = uint64(i)
+		} else {
+			d.err("Assigning negative signed value: %v, to unsigned type", i)
+		}
+	case 0xd3:
+		i := int64(d.readUint64())
+		if i >= 0 {
+			ui = uint64(i)
+		} else {
 			d.err("Assigning negative signed value: %v, to unsigned type", i)
 		}
 	default:
-		d.err("Unhandled single-byte unsigned integer value: %s: %x", msgBadDesc, bd)
+		switch {
+		case d.bd >= 0x00 && d.bd <= 0x7f:
+			ui = uint64(d.bd)
+		case d.bd >= 0xe0 && d.bd <= 0xff:
+			d.err("Assigning negative signed value: %v, to unsigned type", int(d.bd))
+		default:
+			d.err("Unhandled single-byte unsigned integer value: %s: %x", msgBadDesc, d.bd)
+		}
 	}
+	// check overflow (logic adapted from std pkg reflect/value.go OverflowUint()
+	if bitsize > 0 {
+		if trunc := (ui << (64 - bitsize)) >> (64 - bitsize); ui != trunc {
+			d.err("Overflow uint value: %v", ui)
+		}
+	}
+	d.bdRead = false
 	return
+}
+
+// float can either be decoded from msgpack type: float, double or intX
+func (d *Decoder) decodeFloat(chkOverflow32 bool) (f float64) {
+	switch d.bd {
+	case 0xca:
+		f = float64(math.Float32frombits(d.readUint32()))
+	case 0xcb:
+		f = math.Float64frombits(d.readUint64())
+	default:
+		f = float64(d.decodeInt(0))
+	}
+	// check overflow (logic adapted from std pkg reflect/value.go OverflowFloat()
+	if chkOverflow32 {
+		f2 := f
+		if f2 < 0 {
+			f2 = -f
+		}
+		if math.MaxFloat32 < f2 && f2 <= math.MaxFloat64 {
+			d.err("Overflow float32 value: %v", f2)
+		}
+	}
+	d.bdRead = false
+	return
+}
+
+// bool can be decoded from bool, fixnum 0 or 1.
+func (d *Decoder) decodeBool() (b bool) {
+	switch d.bd {
+	case 0xc2, 0x00:
+		// b = false
+	case 0xc3, 0x01:
+		b = true
+	default:
+		d.err("Invalid single-byte value for bool: %s: %x", msgBadDesc, d.bd)
+	}
+	d.bdRead = false
+	return
+}
+	
+func (d *Decoder) decodeString() (s string) {
+	clen := d.readContainerLen(containerRawBytes)
+	if clen > 0 {
+		bs := make([]byte, clen)
+		d.readb(clen, bs)
+		s = string(bs)
+	}
+	d.bdRead = false
+	return
+}
+
+// Return changed=true if length of passed slice is less than length of bytes in the stream.
+// Callers must check if changed=true (to decide whether to replace the one they have)
+func (d *Decoder) decodeBytes(bs []byte) (bsOut []byte, changed bool) {
+	clen := d.readContainerLen(containerRawBytes)
+	if clen < 0 {
+		changed = true
+	}
+	// if no contents in stream, don't update the passed byteslice
+	if clen > 0 {
+		rvlen := len(bs)
+		if rvlen == clen {
+		} else if rvlen > clen {
+			bs = bs[:clen]
+		} else {
+			bs = make([]byte, clen)
+			bsOut = bs
+			changed = true
+		}
+		d.readb(clen, bs)
+	}
+	d.bdRead = false
+	return
+}
+
+// Every top-level decode funcs (i.e. decodeValue, decode) must call this first.
+func (d *Decoder) ensureBdRead() {
+	if d.bdRead {
+		return
+	}
+	d.readb(1, d.t1)
+	d.bd = d.t1[0]
+	d.bdRead = true
+}
+
+// called only before trying to decode again using low-level decode.
+// Used by built-in extension decoders where they don't know exactly how many 
+// encoded values in stream.
+func (d *Decoder) checkEOF() bool {
+	if d.eof {
+		return true
+	}
+	_, err := io.ReadAtLeast(d.r, d.t1, 1) 
+	if err == io.EOF {
+		d.eof = true
+		return true
+	}
+	if err != nil {
+		panic(err)
+	}
+	d.bd = d.t1[0]
+	d.bdRead = true
+	return false
 }
 
 // read a number of bytes into bs
 func (d *Decoder) readb(numbytes int, bs []byte) {
 	n, err := io.ReadAtLeast(d.r, bs, numbytes) 
 	if err != nil {
-		// propagage io.EOF upwards (it's special, and must be returned AS IS)
-		if err == io.EOF {
-			panic(err)
-		} else {
-			d.err("Error: %v", err)
-		}
+		panic(err)
 	} else if n != numbytes {
 		d.err("read: Incorrect num bytes read. Expecting: %v, Received: %v", numbytes, n)
 	}
@@ -702,33 +846,106 @@ func (d *Decoder) readUint64() uint64 {
 	return binary.BigEndian.Uint64(d.t8)
 }
 
-func (d *Decoder) readContainerLen(bd byte, readDesc bool, ct ContainerType) (l int) {
-	// bd is the byte descriptor. First byte is always descriptive.
-	if readDesc {
-		d.readb(1, d.t1)
-		bd = d.t1[0]
-	}
-	_, b0, b1, b2 := getContainerByteDesc(ct)
-
+func (d *Decoder) readContainerLen(ct containerType) (clen int) {
 	switch {
-	case bd == b1:
-		l = int(d.readUint16())
-	case bd == b2:
-		l = int(d.readUint32())
-	case (b0 & bd) == b0:
-		l = int(b0 ^ bd)
+	case d.bd == 0xc0:
+		clen = -1 // to represent nil
+	case d.bd == ct.b1:
+		clen = int(d.readUint16())
+	case d.bd == ct.b2:
+		clen = int(d.readUint32())
+	case (ct.b0 & d.bd) == ct.b0:
+		clen = int(ct.b0 ^ d.bd)
 	default:
-		d.err("readContainerLen: %s: hex: %x, dec: %d", msgBadDesc, bd, bd)
+		d.err("readContainerLen: %s: hex: %x, dec: %d", msgBadDesc, d.bd, d.bd)
 	}
 	return	
+}
+
+func (d *Decoder) chkPtrValue(rv reflect.Value) {
+	// We cannot marshal into a non-pointer or a nil pointer 
+	// (at least pass a nil interface so we can marshal into it)
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		var rvi interface{} = rv
+		if rv.IsValid() && rv.CanInterface() {
+			rvi = rv.Interface()
+		}
+		d.err("DecodeValue: Expecting valid pointer to decode into. Got: %v, %T, %v", rv.Kind(), rvi, rvi)
+	}
+}
+
+func (d *Decoder) readExtLen() (clen int) {
+	switch d.bd {
+	case 0xc0:
+		clen = -1 // to represent nil
+	case 0xc9:
+		clen = int(d.readUint8())
+	case 0xd8:
+		clen = int(d.readUint16())
+	case 0xd9:
+		clen = int(d.readUint32())
+	default: 
+		switch {
+		case d.bd >= 0xc4 && d.bd <= 0xc8:
+			clen = int(d.bd & 0x0f)
+		case d.bd >= 0xd4 && d.bd <= 0xd7:
+			clen = int(d.bd & 0x03)
+		default:
+			d.err("decoding ext bytes: found unexpected byte: %x", d.bd)
+		}
+	}
+	return
 }
 
 func (d *Decoder) err(format string, params ...interface{}) {
 	doPanic(msgTagDec, format, params)
 }
 
+// DecodeTimeExt decodes a byte stream containing one, two or 3 
+// signed integer values into a time.Time, and sets into passed 
+// reflectValue.
+func DecodeTimeExt(rv reflect.Value, bs []byte) (err error) {
+	buf := bytes.NewBuffer(bs)
+
+	d2 := NewDecoder(buf, nil)
+	var tt time.Time
+	var t0, t1 int64
+	var tzOffset int8
+	d2.decode(&t0)
+	if d2.checkEOF() {
+		tt = time.Unix(t0, 0).UTC()
+	} else {
+		d2.decode(&t1)
+		tt = time.Unix(t0, t1).UTC()
+		if !d2.checkEOF() {
+			d2.decode(&tzOffset)
+			tzOffset = tzOffset - 48
+			// In stdlib time.Parse, when a date is parsed without a zone name, it use ""
+			// var tzSign string
+			// tzOffset2 := tzOffset
+			// if tzOffset < 0 {
+			// 	tzSign = "-"
+			// 	tzOffset2 = -tzOffset
+			// }
+			// locname := fmt.Sprintf("UTC:%s%2d:%2d", tzSign, tzOffset2 / 4, (tzOffset2 % 4) / 4 * 60)				
+			tt = tt.In(time.FixedZone("", int(tzOffset) * 15 * 60))
+		}
+	}
+
+	rv.Set(reflect.ValueOf(tt))
+	return
+}
+
+// DecodeBinaryExt sets passed byte array AS-IS into the reflect Value.
+// Configure this to support the Binary Extension using tag 0.
+func DecodeBinaryExt(rv reflect.Value, bs []byte) (err error) {
+	rv.SetBytes(bs)
+	return
+}
+
 // Unmarshal is a convenience function which decodes a stream of bytes into v.
 // It delegates to Decoder.Decode.
-func Unmarshal(data []byte, v interface{}, dam DecoderContainerResolver) error {
-	return NewDecoder(bytes.NewBuffer(data), dam).Decode(v)
+func Unmarshal(data []byte, v interface{}, o *DecoderOptions) error {
+	return NewDecoder(bytes.NewBuffer(data), o).Decode(v)
 }
+

@@ -32,63 +32,84 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 package msgpack
 
-// All non-std package dependencies live in this file,
+// All non-std package dependencies related to testing live in this file,
 // so porting to different environment is easy (just update functions).
 
 import (
-	"reflect"
-	"fmt"
+	"testing"
 	"errors"
+	"reflect"
 )
 
-var (
-	raisePanicAfterRecover = false
-	debugging = false
-
-	showLog = true
-	testLogToT = true
-	failNowOnFail = false
-)
-
-func panicValToErr(panicVal interface{}, err *error) {
-	switch xerr := panicVal.(type) {
-	case error:
-		*err = xerr
-	case string:
-		*err = errors.New(xerr)
-	default:
-		*err = fmt.Errorf("%v", panicVal)
+func checkErrT(t *testing.T, err error) {
+	if err != nil {
+		logT(t, err.Error())
+		failT(t)
 	}
-	if raisePanicAfterRecover {
-		panic(panicVal)
+}
+
+func checkEqualT(t *testing.T, v1 interface{}, v2 interface{}) {
+	if err := deepEqual(v1, v2); err != nil { 
+		logT(t, "Do not match: %v. v1: %v, v2: %v", err, v1, v2)
+		failT(t)
+	}
+}
+
+func logT(x interface{}, format string, args ...interface{}) {
+	if t, ok := x.(*testing.T); ok && t != nil && testLogToT {
+		t.Logf(format, args...)	
+	} else if b, ok := x.(*testing.B); ok && b != nil && testLogToT {
+		b.Logf(format, args...)
+	} else {
+		log(format, args...)
+	}
+}
+
+func failT(t *testing.T) {
+	if failNowOnFail {
+		t.FailNow()
+	} else {
+		t.Fail()
+	}
+}
+
+func deepEqual(v1, v2 interface{}) (err error) {
+	if !reflect.DeepEqual(v1, v2) {
+		err = errors.New("Not Match")
 	}
 	return
 }
 
-func isEmptyValue(v reflect.Value) bool {
-	switch v.Kind() {
-	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
-		return v.Len() == 0
-	case reflect.Bool:
-		return !v.Bool()
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return v.Int() == 0
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return v.Uint() == 0
-	case reflect.Float32, reflect.Float64:
-		return v.Float() == 0
-	case reflect.Interface, reflect.Ptr:
-		return v.IsNil()
-	}
-	return false
-}
-
-func log(format string, args ...interface{}) {
-	if showLog || debugging {
-		if len(format) == 0 || format[len(format)-1] != '\n' {
-			format = format + "\n"
+func approxDataSize(rv reflect.Value) (sum int) {
+	switch rk := rv.Kind(); rk {
+	case reflect.Invalid:
+	case reflect.Ptr, reflect.Interface:
+		sum += int(rv.Type().Size())
+		sum += approxDataSize(rv.Elem())
+	case reflect.Slice:
+		sum += int(rv.Type().Size())
+		for j := 0; j < rv.Len(); j++ {
+			sum += approxDataSize(rv.Index(j))
 		}
-		fmt.Printf(format, args...)
+	case reflect.String:
+		sum += int(rv.Type().Size()) 
+		sum += rv.Len()
+	case reflect.Map:
+		sum += int(rv.Type().Size()) 
+		for _, mk := range rv.MapKeys() {
+			sum += approxDataSize(mk)
+			sum += approxDataSize(rv.MapIndex(mk))
+		}
+	case reflect.Struct:
+		//struct size already includes the full data size.
+		//sum += int(rv.Type().Size())
+		for j := 0; j < rv.NumField(); j++ {
+			sum += approxDataSize(rv.Field(j))
+		}	
+	default:
+		//pure value types
+		sum += int(rv.Type().Size())
 	}
+	return
 }
 
