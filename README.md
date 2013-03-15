@@ -21,20 +21,14 @@ Features
   - Decoding into a pointer to a nil interface{} 
   - Handles binaries and time via provided extensions 
   - Supports Basic and new in-progress Application Profile with extension support.
-    Users can pass custom functions to handle the encode/decode of custom types.
-      Examples:
-        type Bitset []int
-        type UUID []byte
-        type MyStruct { // no exported fields }
-        type MyID int64
   - Options to configure how to handle raw bytes in stream 
     (as string or []byte)
   - Options to configure what type to use when decoding a list or map 
     into a nil interface{}
   - Provides a Server and Client Codec so msgpack can be used as 
     communication protocol for net/rpc.
-    Also includes an option for msgpack-rpc: 
-    http://wiki.msgpack.org/display/MSGPACK/RPC+specification
+    - Also includes an option for msgpack-rpc: 
+      http://wiki.msgpack.org/display/MSGPACK/RPC+specification
 
 Extension Support
 -----------------
@@ -76,10 +70,12 @@ Usage
   // create and configure options
   dopts = msgpack.NewDecoderOptions()
   dopts.MapType = reflect.TypeOf(map[string]interface{}(nil))
-
+  dopts.RawToString = true // only used if binary extension is not configured.
+  
   eopts = msgpack.NewEncoderOptions()
   
   // configure extensions, to enable Binary and Time support for tags 1 and 2
+  // Note that configuring Binary Extensions here ensures Raw is string and binary is ext.
   dopts.AddExt(reflect.TypeOf([]byte(nil)), 0, msgpack.DecodeBinaryExt)
   dopts.AddExt(reflect.TypeOf(time.Time{}), 1, msgpack.DecodeTimeExt)
 

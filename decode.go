@@ -202,10 +202,6 @@ func (d *Decoder) decode(iv interface{}) {
 		d.decodeValue(v)
 	case *string:
 		*v = d.decodeString()
-	case *[]byte:
-		if bs2, changed2 := d.decodeBytes(*v); changed2 {
-			*v = bs2
-		}
 	case *bool:
 		*v = d.decodeBool()
 	case *int:
