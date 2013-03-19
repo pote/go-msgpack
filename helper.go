@@ -43,13 +43,8 @@ import (
 	"fmt"
 	"sort"
 	"time"
+	"encoding/binary"
 )
-
-// A Container type specifies the different types of containers.
-type containerType struct {
-	cutoff int8
-	b0, b1, b2 byte
-}
 
 var (
 	containerRawBytes = containerType{32, 0xa0, 0xda, 0xdb}
@@ -58,6 +53,7 @@ var (
 )
 
 var (
+	binc = binary.BigEndian
 	structInfoFieldName = "_struct"
 	
 	cachedStructFieldInfos = make(map[reflect.Type]*structFieldInfos, 4)
@@ -80,8 +76,14 @@ var (
 
 const (
 	mapAccessThreshold = 4
-	binarySearchThreshold = 9
+	binarySearchThreshold = 16
 )
+
+// A Container type specifies the different types of containers.
+type containerType struct {
+	cutoff int8
+	b0, b1, b2 byte
+}
 
 type structFieldInfo struct {
 	i         int      // field index in struct

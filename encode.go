@@ -37,13 +37,15 @@ import (
 	"bytes"
 	"reflect"
 	"math"
-	"encoding/binary"
 	"time"
 )
 
-// Some tagging information for error messages.
-const msgTagEnc = "msgpack.encoder"
-
+const (
+	// Some tagging information for error messages.
+	msgTagEnc = "msgpack.encoder"
+	// maxTimeSecs32 = math.MaxInt32 / 60 / 24 / 366
+)
+ 
 // An Encoder writes an object to an output stream in the msgpack format.
 type Encoder struct {
 	w io.Writer
@@ -101,9 +103,9 @@ func (o *EncoderOptions) tagFnForType(rt reflect.Type) (xfn encExtTagFn) {
 	if l := len(o.exts); l == 0 {
 		return
 	} else if l < mapAccessThreshold {
-		for _, x := range o.exts {
-			if x.rt == rt {
-				return x.encExtTagFn
+		for i := 0; i < l; i++ {
+			if o.exts[i].rt == rt {
+				return o.exts[i].encExtTagFn
 			}
 		}
 	} else {
@@ -329,11 +331,11 @@ func (e *Encoder) writeContainerLen(ct containerType, l int) {
 		e.writeb(1, e.t1)
 	case l < 65536:
 		e.t3[0] = ct.b1
-		binary.BigEndian.PutUint16(e.t31, uint16(l))
+		binc.PutUint16(e.t31, uint16(l))
 		e.writeb(3, e.t3)
 	default:
 		e.t5[0] = ct.b2
-		binary.BigEndian.PutUint32(e.t51, uint32(l))
+		binc.PutUint32(e.t51, uint32(l))
 		e.writeb(5, e.t5)
 	}
 }
@@ -353,15 +355,15 @@ func (e *Encoder) encInt(i int64) {
 		e.writeb(2, e.t2)
 	case i >= math.MinInt16 && i <= math.MaxInt16:
 		e.t3[0] = 0xd1
-		binary.BigEndian.PutUint16(e.t31, uint16(i))
+		binc.PutUint16(e.t31, uint16(i))
 		e.writeb(3, e.t3)
 	case i >= math.MinInt32 && i <= math.MaxInt32:
 		e.t5[0] = 0xd2
-		binary.BigEndian.PutUint32(e.t51, uint32(i))
+		binc.PutUint32(e.t51, uint32(i))
 		e.writeb(5, e.t5)
 	case i >= math.MinInt64 && i <= math.MaxInt64:
 		e.t9[0] = 0xd3
-		binary.BigEndian.PutUint64(e.t91, uint64(i))
+		binc.PutUint64(e.t91, uint64(i))
 		e.writeb(9, e.t9)
 	default:
 		e.err("encInt64: Unreachable block")
@@ -378,15 +380,15 @@ func (e *Encoder) encUint(i uint64) {
 		e.writeb(2, e.t2)
 	case i <= math.MaxUint16:
 		e.t3[0] = 0xcd
-		binary.BigEndian.PutUint16(e.t31, uint16(i))
+		binc.PutUint16(e.t31, uint16(i))
 		e.writeb(3, e.t3)
 	case i <= math.MaxUint32:
 		e.t5[0] = 0xce
-		binary.BigEndian.PutUint32(e.t51, uint32(i))
+		binc.PutUint32(e.t51, uint32(i))
 		e.writeb(5, e.t5)
 	default:
 		e.t9[0] = 0xcf
-		binary.BigEndian.PutUint64(e.t91, i)
+		binc.PutUint64(e.t91, i)
 		e.writeb(9, e.t9)
 	}
 }
@@ -402,26 +404,27 @@ func (e *Encoder) encBool(b bool) {
 
 func (e *Encoder) encFloat32(f float32) {
 	e.t5[0] = 0xca
-	binary.BigEndian.PutUint32(e.t51, math.Float32bits(f))
+	binc.PutUint32(e.t51, math.Float32bits(f))
 	e.writeb(5, e.t5)
 }
 
 func (e *Encoder) encFloat64(f float64) {
 	e.t9[0] = 0xcb
-	binary.BigEndian.PutUint64(e.t91, math.Float64bits(f))
+	binc.PutUint64(e.t91, math.Float64bits(f))
 	e.writeb(9, e.t9)
 }
 
 
 func (e *Encoder) encodeStruct(rt reflect.Type, rv reflect.Value) {
 	sis := getStructFieldInfos(rt)
+	l := len(sis.sis)
 	// encNames := make([]string, len(sis.sis))
-	rvals := make([]reflect.Value, len(sis.sis))
-	sivals := make([]int, len(sis.sis))
+	rvals := make([]reflect.Value, l)
+	sivals := make([]int, l)
 	newlen := 0
-	for i, si := range sis.sis {
-		rval0 := si.field(rv)
-		if si.omitEmpty && isEmptyValue(rval0) {
+	for i := 0; i < l; i++ {
+		rval0 := sis.sis[i].field(rv)
+		if sis.sis[i].omitEmpty && isEmptyValue(rval0) {
 			continue
 		}
 		// encNames[newlen] = si.encName // si.encNameBs
@@ -475,11 +478,11 @@ func (e *Encoder) encExtBytes(xtag byte, bs []byte) {
 		e.writeb(3, e.t3)	
 	case l < 65536:
 		e.x[0] = 0xd8
-		binary.BigEndian.PutUint16(e.t42, uint16(l))
+		binc.PutUint16(e.t42, uint16(l))
 		e.writeb(4, e.t4)	
 	default:
 		e.x[0] = 0xd9
-		binary.BigEndian.PutUint32(e.t62, uint32(l))
+		binc.PutUint32(e.t62, uint32(l))
 		e.writeb(6, e.t6)		
 	}
 	e.writeb(l, bs)
@@ -505,21 +508,36 @@ func (e *Encoder) err(format string, params ...interface{}) {
 // from UTC (added if the timezone is not UTC).
 func EncodeTimeExt(rv reflect.Value) ([]byte, error) {
 	t := rv.Interface().(time.Time)
-	
-	buf := new(bytes.Buffer)
-	e2 := NewEncoder(buf, nil)
-	
-	e2.encInt(t.Unix())
-	if t.Location() == time.UTC {
-		if t.Nanosecond() != 0 {
-			e2.encInt(int64(t.Nanosecond()))
-		}
-	} else {
-		e2.encInt(int64(t.Nanosecond()))
-		_, zoneOffset := t.Zone()
-		e2.encInt((int64(zoneOffset) / 60 / 15) + 48)
+	tsecs, tnsecs := t.Unix(), t.Nanosecond()
+	var padzero bool
+	var bs [14]byte
+	var i int
+	l := t.Location()
+	if l == time.UTC {
+		l = nil
 	}
-	return buf.Bytes(), nil
+	if tsecs > math.MinInt32 && tsecs < math.MaxInt32 {
+		binc.PutUint32(bs[i:], uint32(int32(tsecs)))
+		i = i + 4
+	} else {
+		binc.PutUint64(bs[i:], uint64(tsecs))
+		i = i + 8
+		padzero = (tnsecs == 0)
+	}
+	if tnsecs != 0 {
+		binc.PutUint32(bs[i:], uint32(tnsecs))
+		i = i + 4
+	}
+	if l != nil {
+		_, zoneOffset := t.Zone()
+		binc.PutUint16(bs[i:], uint16(int16(zoneOffset / 60)))
+		i = i + 2
+	}
+	if padzero {
+		i = i + 1
+	}
+	// log(">>>> EncodeTimeExt: t: %v, len: %v, v: %v", t, i, bs[0:i])
+	return bs[0:i], nil
 }
 
 // EncodeBinaryExt returns the underlying bytes of this value AS-IS.
@@ -538,3 +556,20 @@ func Marshal(v interface{}, o *EncoderOptions) (b []byte, err error) {
 	return
 }
 
+/*
+	buf := new(bytes.Buffer)
+	e2 := NewEncoder(buf, nil)
+	
+	e2.encInt(t.Unix())
+	if t.Location() == time.UTC {
+		if t.Nanosecond() != 0 {
+			e2.encInt(int64(t.Nanosecond()))
+		}
+	} else {
+		e2.encInt(int64(t.Nanosecond()))
+		_, zoneOffset := t.Zone()
+		e2.encInt((int64(zoneOffset) / 60 / 15) + 48)
+	}
+	return buf.Bytes(), nil
+
+*/

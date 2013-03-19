@@ -65,6 +65,8 @@ import (
 )
 
 var (
+	testInitDebug bool
+	
 	_ = fmt.Printf
 	skipVerifyVal interface{} = &(struct{}{})
 	timeToCompare = time.Date(2012, 2, 2, 2, 2, 2, 2000, time.UTC) //time.Time{} //
@@ -76,16 +78,16 @@ var (
 	tablePythonVerify []interface{}   // for verifying for python, since Python sometimes
                                       // will encode a float32 as float64, or large int as uint
 	testRpcInt = new(TestRpcInt)
-	testInitDebug = flag.Bool("tdbg", false, "Test Debug")
 	testEncOpts = NewEncoderOptions()
 	testDecOpts = NewDecoderOptions()
 )
 
 func init() {
 	// delete(testDecOpts.ExtFuncs, timeTyp)
+	flag.BoolVar(&testInitDebug, "tdbg", false, "Test Debug")
 	flag.Parse()
 	gob.Register(new(TestStruc))
-	if *testInitDebug {
+	if testInitDebug {
 		ts0 := newTestStruc(2, false)
 		fmt.Printf("====> depth: %v, ts: %#v\n", 2, ts0)
 	}
@@ -630,7 +632,9 @@ func testRpc(t *testing.T, callClose, doBasic, doCustom, doExit bool) {
 
 // Comprehensive testing that generates data encoded from python msgpack, 
 // and validates that our code can read and write it out accordingly.
-func TestPythonGenStreams(t *testing.T) {
+// We keep this unexported here, and put actual test in ext_dep_test.go.
+// This way, it can be excluded by excluding file completely.
+func doTestPythonGenStreams(t *testing.T) {
 	logT(t, "TestPythonGenStreams")
 	tmpdir, err := ioutil.TempDir("", "golang-msgpack-test") 
 	if err != nil {
@@ -664,9 +668,9 @@ func TestPythonGenStreams(t *testing.T) {
 			failT(t)
 			continue
 		}
-		dopts := testDecOpts
+		dopts := *testDecOpts
 		dopts.MapType = mapStringIntfTyp
-		dec := NewDecoder(bytes.NewBuffer(bss), dopts)
+		dec := NewDecoder(bytes.NewBuffer(bss), &dopts)
 		var v1 interface{}
 		if err = dec.Decode(&v1); err != nil {
 			logT(t, "-------- Error decoding stream: %d: Err: %v", i, err)
