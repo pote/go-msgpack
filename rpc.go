@@ -1,4 +1,3 @@
-
 /*
 go-msgpack - Msgpack library for Go. Provides pack/unpack and net/rpc support.
 https://github.com/ugorji/go-msgpack
@@ -179,7 +178,7 @@ func (c *basicRpcCodec) ReadRequestHeader(r *rpc.Request) error {
 
 // /////////////// Custom RPC Codec ///////////////////
 func (c *customRpcCodec) WriteRequest(r *rpc.Request, body interface{}) error {
-	return c.writeCustomBody(0, r.Seq, r.ServiceMethod, []interface{}{body})
+	return c.writeCustomBody(0, r.Seq, r.ServiceMethod, body)
 }
 
 func (c *customRpcCodec) WriteResponse(r *rpc.Response, body interface{}) error {
@@ -187,8 +186,7 @@ func (c *customRpcCodec) WriteResponse(r *rpc.Response, body interface{}) error 
 }
 
 func (c *customRpcCodec) ReadRequestBody(body interface{}) error {
-	bodyArr := []interface{}{body}
-	return c.dec.Decode(&bodyArr)
+	return c.dec.Decode(body)
 }
 
 func (c *customRpcCodec) ReadResponseHeader(r *rpc.Response) error {
