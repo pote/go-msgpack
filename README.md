@@ -1,6 +1,17 @@
 MsgPack library for Go.
 =======================
 
+> **This library has been deprecated.**  
+> Please use [https://github.com/ugorji/go/tree/master/codec#readme]  
+> go/codec is significantly faster, cleaner, more correct and more complete than go-msgpack.  
+>    Really, see the readme in link above.
+> 
+> Due to all around API changes and a model allowing use of core code for multiple codecs,  
+> It made more sense to create a new repository.  
+> I hope to retire this repository in a month or so.
+> 
+> A log message will be printed out to all users encouraging them to upgrade.
+
 Implements:
 >  [http://wiki.msgpack.org/display/MSGPACK/Format+specification]
 
