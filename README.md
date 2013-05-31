@@ -7,12 +7,12 @@ MsgPack library for Go.
 > which is significantly faster, cleaner, more correct and more complete  
 > See [https://github.com/ugorji/go/tree/master/codec#readme]  
 > 
-> Due to all around API changes which allow us support multiple codecs (binc and msgpack), 
-> It made more sense to create a new repository.  
+> A complete redesign was done which also accomodates multiple codec formats.
+> It thus became necessary to create a new repository with a different name. 
 > 
-> I hope to retire this repository in a month or so.
+> I hope to retire this repository anytime from July 1, 2013.
 > 
-> A log message will be printed out at runtime encouraging them to upgrade.
+> A log message will be printed out at runtime encouraging users to upgrade.
 
 ## About go-msgpack
 

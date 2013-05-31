@@ -40,19 +40,7 @@ import (
 	"strings"
 	"fmt"
 	"time"
-	golog "log"
 )
-
-func init() {
-	//printout deprecation notice
-	golog.Print(`
-************************************************ 
-package github.com/ugorji/go-msgpack has been deprecated. 
-Please update to faster and much much better github.com/ugorji/go/codec.
-See https://github.com/ugorji/go/tree/master/codec#readme for more information.
-************************************************ 
-`)
-}
 
 type ContainerType byte
 

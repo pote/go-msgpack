@@ -31,7 +31,20 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 /*
-MsgPack library for Go.
+MsgPack library for Go (DEPRECATED - Replacement: go get github.com/ugorji/go/codec)
+
+  THIS LIBRARY IS DEPRECATED (May 29, 2013)
+  
+  Please use github.com/ugorji/go/codec
+  which is significantly faster, cleaner, more correct and more complete.
+  See [https://github.com/ugorji/go/tree/master/codec#readme]
+  
+  A complete redesign was done which also accomodates multiple codec formats.
+  It thus became necessary to create a new repository with a different name. 
+  
+  I hope to retire this repository anytime from July 1, 2013.
+  
+  A log message will be printed out at runtime encouraging users to upgrade.
 
 Implements:
   http://wiki.msgpack.org/display/MSGPACK/Format+specification
@@ -73,4 +86,15 @@ Usage
 */
 package msgpack
 
-
+import golog "log"
+func init() {
+	//printout deprecation notice
+	golog.Print(`
+************************************************ 
+package github.com/ugorji/go-msgpack has been deprecated (05/29/2013). 
+It will be retired anytime from July 1, 2013.
+Please update to faster and much much better github.com/ugorji/go/codec.
+See https://github.com/ugorji/go/tree/master/codec#readme for more information.
+************************************************ 
+`)
+}
