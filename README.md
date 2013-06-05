@@ -1,4 +1,4 @@
-# MsgPack library for Go (DEPRECATED as of May 29, 2013)
+# MsgPack library for Go (DEPRECATED)
 
 > DEPRECATED as of May 29, 2013. Please use github.com/ugorji/go/codec  
 > which is significantly faster, cleaner, more correct and more complete.  
